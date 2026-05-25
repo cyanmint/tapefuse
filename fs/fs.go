@@ -23,17 +23,16 @@ const flushFileName = ".tapefuse_flush"
 
 type TapeFS struct {
 	Device         string
-	IndexPartition *tape.Partition
-	DataPartition  *tape.Partition
+	IndexPartition tape.Tape
+	DataPartition  tape.Tape
 	IndexLabel     *ltfs.Label
 	DataLabel      *ltfs.Label
-	Index          *ltfs.Index
 }
 
 type FS struct {
-	tape  *TapeFS
-	index *ltfs.Index
-	mu    sync.RWMutex
+	tape      *TapeFS
+	indexPath string
+	mu        sync.RWMutex
 }
 
 type Dir struct {
@@ -62,9 +61,17 @@ type FlushHandle struct {
 }
 
 func OpenTape(device string) (*TapeFS, error) {
+	isChar, err := tape.IsCharDevice(device)
+	if err == nil && isChar {
+		idxPart, dataPart, idxLabel, dataLabel, err := openSCSIPartitions(device)
+		if err != nil {
+			return nil, err
+		}
+		return NewTapeFSFromParts(device, idxPart, dataPart, idxLabel, dataLabel), nil
+	}
+
 	p0 := device + ".p0.dat"
 	p1 := device + ".p1.dat"
-
 	_, err0 := os.Stat(p0)
 	_, err1 := os.Stat(p1)
 	if errors.Is(err0, os.ErrNotExist) && errors.Is(err1, os.ErrNotExist) {
@@ -84,29 +91,18 @@ func OpenTape(device string) (*TapeFS, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	closeBoth := func() {
-		_ = idxPart.Close()
-		_ = dataPart.Close()
-	}
-
-	indexRec, err := idxPart.ReadAt(3)
-	if err != nil {
-		closeBoth()
-		return nil, err
-	}
-	index, err := ltfs.ParseIndex(indexRec.Data)
-	if err != nil {
-		closeBoth()
-		return nil, err
-	}
-
-	return NewTapeFSFromParts(device, idxPart, dataPart, idxLabel, dataLabel, index), nil
+	return NewTapeFSFromParts(device, idxPart, dataPart, idxLabel, dataLabel), nil
 }
 
-// OpenTapePartitions opens the two partition files for a device without reading the index.
-// It returns the two partitions and labels. The caller must Close both partitions.
-func OpenTapePartitions(device string) (*tape.Partition, *tape.Partition, *ltfs.Label, *ltfs.Label, error) {
+func OpenTapePartitions(device string) (tape.Tape, tape.Tape, *ltfs.Label, *ltfs.Label, error) {
+	isChar, err := tape.IsCharDevice(device)
+	if err == nil && isChar {
+		return openSCSIPartitions(device)
+	}
+	return openFileTapePartitions(device)
+}
+
+func openFileTapePartitions(device string) (tape.Tape, tape.Tape, *ltfs.Label, *ltfs.Label, error) {
 	p0 := device + ".p0.dat"
 	p1 := device + ".p1.dat"
 	idxPart, err := tape.Open(p0)
@@ -142,6 +138,27 @@ func OpenTapePartitions(device string) (*tape.Partition, *tape.Partition, *ltfs.
 		_ = dataPart.Close()
 		return nil, nil, nil, nil, err
 	}
+	return idxPart, dataPart, idxLabel, dataLabel, nil
+}
+
+func openSCSIPartitions(device string) (tape.Tape, tape.Tape, *ltfs.Label, *ltfs.Label, error) {
+	idxPart, dataPart, err := tape.OpenSCSI(device)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	idxLabelRec, err := idxPart.ReadAt(1)
+	if err != nil {
+		_ = idxPart.Close()
+		_ = dataPart.Close()
+		return nil, nil, nil, nil, err
+	}
+	idxLabel, err := ltfs.ParseLabel(idxLabelRec.Data)
+	if err != nil {
+		_ = idxPart.Close()
+		_ = dataPart.Close()
+		return nil, nil, nil, nil, err
+	}
+	dataLabel := ltfs.NewLabel("b", idxLabel.VolumeUUID)
 	return idxPart, dataPart, idxLabel, dataLabel, nil
 }
 
@@ -243,39 +260,68 @@ func formatTape(device string) (*TapeFS, error) {
 		DataPartition:  dataPart,
 		IndexLabel:     idxLabel,
 		DataLabel:      dataLabel,
-		Index:          index,
 	}, nil
 }
 
-// NewTapeFSFromParts creates a TapeFS from already-opened partitions and a pre-loaded index.
-func NewTapeFSFromParts(device string, idxPart, dataPart *tape.Partition, idxLabel, dataLabel *ltfs.Label, index *ltfs.Index) *TapeFS {
+func formatSCSITape(device string) (*TapeFS, error) {
+	idxPart, dataPart, err := tape.CreateSCSI(device)
+	if err != nil {
+		return nil, err
+	}
+	idxLabelRec, err := idxPart.ReadAt(1)
+	if err != nil {
+		_ = idxPart.Close()
+		_ = dataPart.Close()
+		return nil, err
+	}
+	idxLabel, err := ltfs.ParseLabel(idxLabelRec.Data)
+	if err != nil {
+		_ = idxPart.Close()
+		_ = dataPart.Close()
+		return nil, err
+	}
+	dataLabel := ltfs.NewLabel("b", idxLabel.VolumeUUID)
 	return &TapeFS{
 		Device:         device,
 		IndexPartition: idxPart,
 		DataPartition:  dataPart,
 		IndexLabel:     idxLabel,
 		DataLabel:      dataLabel,
-		Index:          index,
+	}, nil
+}
+
+func NewTapeFSFromParts(device string, idxPart, dataPart tape.Tape, idxLabel, dataLabel *ltfs.Label) *TapeFS {
+	return &TapeFS{
+		Device:         device,
+		IndexPartition: idxPart,
+		DataPartition:  dataPart,
+		IndexLabel:     idxLabel,
+		DataLabel:      dataLabel,
 	}
 }
 
-// FormatTape initializes a new tape image at device, writing VOL1 + LTFS label + empty index.
 func FormatTape(device string) (*TapeFS, error) {
+	isChar, err := tape.IsCharDevice(device)
+	if err == nil && isChar {
+		return formatSCSITape(device)
+	}
 	return formatTape(device)
 }
 
-func New(tapeFS *TapeFS) *FS {
-	return &FS{tape: tapeFS, index: tapeFS.Index}
+func New(tapeFS *TapeFS, indexPath string) *FS {
+	return &FS{tape: tapeFS, indexPath: indexPath}
 }
 
 func (f *FS) Root() (bazilfs.Node, error) {
 	return &Dir{fs: f, path: "/"}, nil
 }
 
-func (f *FS) FlushIndex() error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.tape.FlushIndex()
+func (f *FS) loadIndex() (*ltfs.Index, error) {
+	return ltfs.LoadIndexFromFile(f.indexPath)
+}
+
+func (f *FS) saveIndex(idx *ltfs.Index) error {
+	return ltfs.SaveIndexToFile(f.indexPath, idx)
 }
 
 func (f *FS) Close() error {
@@ -295,14 +341,22 @@ func (t *TapeFS) Close() error {
 	return firstErr
 }
 
-func (t *TapeFS) FlushIndex() error {
-	prev := t.Index.Location
-	t.Index.GenerationNumber++
-	t.Index.UpdateTime = ltfs.Now()
-	t.Index.PrevGenLocation = prev
-	t.Index.Location = ltfs.Location{Partition: "a", StartBlock: 3}
+func (t *TapeFS) ReadIndexFromTape() (*ltfs.Index, error) {
+	rec, err := t.IndexPartition.ReadAt(3)
+	if err != nil {
+		return nil, err
+	}
+	return ltfs.ParseIndex(rec.Data)
+}
 
-	data, err := t.Index.Marshal()
+func (t *TapeFS) FlushIndex(idx *ltfs.Index) error {
+	prev := idx.Location
+	idx.GenerationNumber++
+	idx.UpdateTime = ltfs.Now()
+	idx.PrevGenLocation = prev
+	idx.Location = ltfs.Location{Partition: "a", StartBlock: 3}
+
+	data, err := idx.Marshal()
 	if err != nil {
 		return err
 	}
@@ -313,7 +367,7 @@ func (t *TapeFS) FlushIndex() error {
 	if err != nil {
 		return err
 	}
-	t.Index.Location = ltfs.Location{Partition: "a", StartBlock: blockNum}
+	idx.Location = ltfs.Location{Partition: "a", StartBlock: blockNum}
 	if _, err := t.IndexPartition.WriteFilemark(); err != nil {
 		return err
 	}
@@ -411,7 +465,7 @@ func (t *TapeFS) AppendFileData(data []byte) (ltfs.Extent, error) {
 	}, nil
 }
 
-func (t *TapeFS) partitionFor(partition string) *tape.Partition {
+func (t *TapeFS) partitionFor(partition string) tape.Tape {
 	switch partition {
 	case "a":
 		return t.IndexPartition
@@ -476,7 +530,11 @@ func (d *Dir) Attr(_ context.Context, a *fuse.Attr) error {
 	d.fs.mu.RLock()
 	defer d.fs.mu.RUnlock()
 
-	dir := d.fs.index.FindDirectory(d.path)
+	idx, err := d.fs.loadIndex()
+	if err != nil {
+		return fuse.EIO
+	}
+	dir := idx.FindDirectory(d.path)
 	if dir == nil {
 		return fuse.ENOENT
 	}
@@ -495,7 +553,11 @@ func (d *Dir) Lookup(_ context.Context, name string) (bazilfs.Node, error) {
 	d.fs.mu.RLock()
 	defer d.fs.mu.RUnlock()
 
-	dir := d.fs.index.FindDirectory(d.path)
+	idx, err := d.fs.loadIndex()
+	if err != nil {
+		return nil, fuse.EIO
+	}
+	dir := idx.FindDirectory(d.path)
 	if dir == nil {
 		return nil, fuse.ENOENT
 	}
@@ -512,7 +574,11 @@ func (d *Dir) ReadDirAll(_ context.Context) ([]fuse.Dirent, error) {
 	d.fs.mu.RLock()
 	defer d.fs.mu.RUnlock()
 
-	dir := d.fs.index.FindDirectory(d.path)
+	idx, err := d.fs.loadIndex()
+	if err != nil {
+		return nil, fuse.EIO
+	}
+	dir := idx.FindDirectory(d.path)
 	if dir == nil {
 		return nil, fuse.ENOENT
 	}
@@ -538,7 +604,11 @@ func (d *Dir) Create(_ context.Context, req *fuse.CreateRequest, _ *fuse.CreateR
 	d.fs.mu.Lock()
 	defer d.fs.mu.Unlock()
 
-	dir := d.fs.index.FindDirectory(d.path)
+	idx, err := d.fs.loadIndex()
+	if err != nil {
+		return nil, nil, fuse.EIO
+	}
+	dir := idx.FindDirectory(d.path)
 	if dir == nil {
 		return nil, nil, fuse.ENOENT
 	}
@@ -546,9 +616,12 @@ func (d *Dir) Create(_ context.Context, req *fuse.CreateRequest, _ *fuse.CreateR
 		return nil, nil, fuse.EEXIST
 	}
 
-	file := ltfs.NewFile(req.Name, d.fs.index.NextFileUID())
+	file := ltfs.NewFile(req.Name, idx.NextFileUID())
 	dir.Contents.Files = append(dir.Contents.Files, file)
 	ltfs.TouchDirectory(dir, ltfs.Now())
+	if err := d.fs.saveIndex(idx); err != nil {
+		return nil, nil, err
+	}
 
 	childPath := joinPath(d.path, req.Name)
 	handle := &FileHandle{fs: d.fs, path: childPath, data: []byte{}}
@@ -563,7 +636,11 @@ func (d *Dir) Mkdir(_ context.Context, req *fuse.MkdirRequest) (bazilfs.Node, er
 	d.fs.mu.Lock()
 	defer d.fs.mu.Unlock()
 
-	dir := d.fs.index.FindDirectory(d.path)
+	idx, err := d.fs.loadIndex()
+	if err != nil {
+		return nil, fuse.EIO
+	}
+	dir := idx.FindDirectory(d.path)
 	if dir == nil {
 		return nil, fuse.ENOENT
 	}
@@ -574,6 +651,9 @@ func (d *Dir) Mkdir(_ context.Context, req *fuse.MkdirRequest) (bazilfs.Node, er
 	child := ltfs.NewDirectory(req.Name)
 	dir.Contents.Directories = append(dir.Contents.Directories, child)
 	ltfs.TouchDirectory(dir, ltfs.Now())
+	if err := d.fs.saveIndex(idx); err != nil {
+		return nil, err
+	}
 	return &Dir{fs: d.fs, path: joinPath(d.path, req.Name)}, nil
 }
 
@@ -585,7 +665,11 @@ func (d *Dir) Remove(_ context.Context, req *fuse.RemoveRequest) error {
 	d.fs.mu.Lock()
 	defer d.fs.mu.Unlock()
 
-	dir := d.fs.index.FindDirectory(d.path)
+	idx, err := d.fs.loadIndex()
+	if err != nil {
+		return fuse.EIO
+	}
+	dir := idx.FindDirectory(d.path)
 	if dir == nil {
 		return fuse.ENOENT
 	}
@@ -601,7 +685,7 @@ func (d *Dir) Remove(_ context.Context, req *fuse.RemoveRequest) error {
 			}
 			dir.Contents.Directories = append(dir.Contents.Directories[:i], dir.Contents.Directories[i+1:]...)
 			ltfs.TouchDirectory(dir, now)
-			return nil
+			return d.fs.saveIndex(idx)
 		}
 		return fuse.ENOENT
 	}
@@ -612,7 +696,7 @@ func (d *Dir) Remove(_ context.Context, req *fuse.RemoveRequest) error {
 		}
 		dir.Contents.Files = append(dir.Contents.Files[:i], dir.Contents.Files[i+1:]...)
 		ltfs.TouchDirectory(dir, now)
-		return nil
+		return d.fs.saveIndex(idx)
 	}
 	return fuse.ENOENT
 }
@@ -629,8 +713,12 @@ func (d *Dir) Rename(_ context.Context, req *fuse.RenameRequest, newDir bazilfs.
 	d.fs.mu.Lock()
 	defer d.fs.mu.Unlock()
 
-	oldParent := d.fs.index.FindDirectory(d.path)
-	newParent := d.fs.index.FindDirectory(targetDir.path)
+	idx, err := d.fs.loadIndex()
+	if err != nil {
+		return fuse.EIO
+	}
+	oldParent := idx.FindDirectory(d.path)
+	newParent := idx.FindDirectory(targetDir.path)
 	if oldParent == nil || newParent == nil {
 		return fuse.ENOENT
 	}
@@ -658,7 +746,7 @@ func (d *Dir) Rename(_ context.Context, req *fuse.RenameRequest, newDir bazilfs.
 		if oldParent != newParent {
 			ltfs.TouchDirectory(newParent, now)
 		}
-		return nil
+		return d.fs.saveIndex(idx)
 	}
 
 	for i, child := range oldParent.Contents.Directories {
@@ -674,7 +762,7 @@ func (d *Dir) Rename(_ context.Context, req *fuse.RenameRequest, newDir bazilfs.
 		if oldParent != newParent {
 			ltfs.TouchDirectory(newParent, now)
 		}
-		return nil
+		return d.fs.saveIndex(idx)
 	}
 
 	return fuse.ENOENT
@@ -684,7 +772,11 @@ func (f *File) Attr(_ context.Context, a *fuse.Attr) error {
 	f.fs.mu.RLock()
 	defer f.fs.mu.RUnlock()
 
-	file, _, err := f.fs.index.FindFile(f.path)
+	idx, err := f.fs.loadIndex()
+	if err != nil {
+		return fuse.EIO
+	}
+	file, _, err := idx.FindFile(f.path)
 	if err != nil {
 		return fuse.ENOENT
 	}
@@ -700,7 +792,11 @@ func (f *File) Open(_ context.Context, req *fuse.OpenRequest, _ *fuse.OpenRespon
 	f.fs.mu.RLock()
 	defer f.fs.mu.RUnlock()
 
-	file, _, err := f.fs.index.FindFile(f.path)
+	idx, err := f.fs.loadIndex()
+	if err != nil {
+		return nil, fuse.EIO
+	}
+	file, _, err := idx.FindFile(f.path)
 	if err != nil {
 		return nil, fuse.ENOENT
 	}
@@ -765,7 +861,11 @@ func (h *FileHandle) Release(_ context.Context, _ *fuse.ReleaseRequest) error {
 	h.fs.mu.Lock()
 	defer h.fs.mu.Unlock()
 
-	file, parent, err := h.fs.index.FindFile(h.path)
+	idx, err := h.fs.loadIndex()
+	if err != nil {
+		return fuse.EIO
+	}
+	file, parent, err := idx.FindFile(h.path)
 	if err != nil {
 		return fuse.ENOENT
 	}
@@ -784,7 +884,7 @@ func (h *FileHandle) Release(_ context.Context, _ *fuse.ReleaseRequest) error {
 	}
 	ltfs.TouchFile(file, now)
 	ltfs.TouchDirectory(parent, now)
-	return nil
+	return h.fs.saveIndex(idx)
 }
 
 func (h *FileHandle) Flush(_ context.Context, _ *fuse.FlushRequest) error {
@@ -807,7 +907,17 @@ func (h *FlushHandle) Read(_ context.Context, _ *fuse.ReadRequest, resp *fuse.Re
 }
 
 func (h *FlushHandle) Write(_ context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
-	if err := h.fs.FlushIndex(); err != nil {
+	h.fs.mu.Lock()
+	defer h.fs.mu.Unlock()
+
+	idx, err := h.fs.loadIndex()
+	if err != nil {
+		return fuse.EIO
+	}
+	if err := h.fs.tape.FlushIndex(idx); err != nil {
+		return err
+	}
+	if err := h.fs.saveIndex(idx); err != nil {
 		return err
 	}
 	resp.Size = len(req.Data)

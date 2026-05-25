@@ -46,6 +46,26 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error: %s\n", resp.Error)
 		os.Exit(1)
 	}
+
+	if cmd == "list" {
+		if len(resp.Entries) == 0 {
+			fmt.Println("no tapes assigned")
+			return
+		}
+		for _, e := range resp.Entries {
+			status := "not loaded"
+			if e.Loaded {
+				status = "loaded"
+			}
+			mount := ""
+			if e.MountPoint != "" {
+				mount = fmt.Sprintf(" (mounted at %s)", e.MountPoint)
+			}
+			fmt.Printf("%s: %s  [%s]%s\n", e.Letter, e.Device, status, mount)
+		}
+		return
+	}
+
 	fmt.Println("ok")
 }
 
@@ -61,6 +81,7 @@ Commands:
   discard <letter>            discard disk cache index
   mount <letter> <mountpoint> mount tape filesystem
   umount <letter>             unmount tape filesystem
-  eject <letter>              eject tape`)
+  eject <letter>              eject tape
+  list                        list assigned tapes and their status`)
 	os.Exit(1)
 }

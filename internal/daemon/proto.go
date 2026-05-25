@@ -12,8 +12,16 @@ type Request struct {
 }
 
 type Response struct {
-	OK    bool   `json:"ok"`
-	Error string `json:"error,omitempty"`
+	OK      bool          `json:"ok"`
+	Error   string        `json:"error,omitempty"`
+	Entries []EntryStatus `json:"entries,omitempty"`
+}
+
+type EntryStatus struct {
+	Letter     string `json:"letter"`
+	Device     string `json:"device"`
+	Loaded     bool   `json:"loaded"`
+	MountPoint string `json:"mountpoint,omitempty"`
 }
 
 // IndexPath returns the disk cache path for a letter.

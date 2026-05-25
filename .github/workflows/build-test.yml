@@ -25,11 +25,11 @@ jobs:
       - name: Verify dependencies
         run: go mod verify
 
-      - name: Build ltaped
-        run: go build -v -o ltaped ./cmd/ltaped
+      - name: Build ltaped (static)
+        run: CGO_ENABLED=0 go build -v -ldflags '-extldflags "-static"' -o ltaped ./cmd/ltaped
 
-      - name: Build ltape
-        run: go build -v -o ltape ./cmd/ltape
+      - name: Build ltape (static)
+        run: CGO_ENABLED=0 go build -v -ldflags '-extldflags "-static"' -o ltape ./cmd/ltape
 
       - name: Run unit tests
         run: go test -v ./internal/tape/... ./internal/ltfs/...
@@ -40,14 +40,42 @@ jobs:
       - name: go vet
         run: go vet ./...
 
-      - name: Upload ltaped artifact
+      - name: Upload binaries artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ltaped
-          path: ltaped
+          name: ltape-binaries
+          path: |
+            ltaped
+            ltape
 
-      - name: Upload ltape artifact
-        uses: actions/upload-artifact@v4
+  mhvtl-test:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          name: ltape
-          path: ltape
+          go-version-file: go.mod
+
+      - name: Install MHVTL
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y mhvtl sg3-utils mt-st || true
+          sudo modprobe mhvtl 2>/dev/null || true
+          sudo vxd 2>/dev/null || true
+          sleep 3
+          ls /dev/st* 2>/dev/null || echo "No tape devices found (OK for CI)"
+
+      - name: Run MHVTL integration tests
+        run: |
+          DEV=$(ls /dev/nst* 2>/dev/null | head -1)
+          if [ -n "$DEV" ]; then
+            echo "Using tape device: $DEV"
+            TAPEFUSE_TEST_DEVICE="$DEV" go test -v -run TestMHVTL -timeout 120s ./internal/tape/... || true
+          else
+            echo "No tape devices available, skipping MHVTL test"
+          fi

@@ -21,6 +21,8 @@ type Record struct {
 	Data []byte
 }
 
+var _ Tape = (*Partition)(nil)
+
 type Partition struct {
 	mu         sync.Mutex
 	f          *os.File
@@ -203,4 +205,8 @@ func (p *Partition) Close() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.f.Close()
+}
+
+func (p *Partition) Eject() error {
+	return nil
 }
