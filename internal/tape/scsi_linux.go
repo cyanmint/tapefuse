@@ -3,11 +3,14 @@
 package tape
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"sync"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -72,13 +75,28 @@ func CreateSCSI(device string) (Tape, Tape, error) {
 func openSCSITape(device string) (*SCSITape, error) {
 	f, err := os.OpenFile(device, os.O_RDWR, 0)
 	if err != nil {
+		if errors.Is(err, unix.ENOMEDIUM) {
+			return nil, fmt.Errorf("%s: no tape loaded — insert a tape and run 'swallow' if needed: %w", device, err)
+		}
 		return nil, err
 	}
 	return &SCSITape{f: f, fd: int(f.Fd()), device: device}, nil
 }
 
+// openSCSITapeNonBlocking opens the tape device with O_NONBLOCK so the call
+// succeeds even when no tape is currently loaded in the drive.  This is the
+// right mode for sending MTLOAD (swallow), because the ioctl itself blocks
+// until the drive reports ready.
+func openSCSITapeNonBlocking(device string) (*SCSITape, error) {
+	f, err := os.OpenFile(device, os.O_RDWR|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open tape device %s: %w", device, err)
+	}
+	return &SCSITape{f: f, fd: int(f.Fd()), device: device}, nil
+}
+
 func SwallowSCSI(device string) error {
-	t, err := openSCSITape(device)
+	t, err := openSCSITapeNonBlocking(device)
 	if err != nil {
 		return err
 	}
