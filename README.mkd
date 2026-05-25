@@ -1,0 +1,441 @@
+# tapefuse
+
+tapefuse is a Linux userspace daemon and CLI tool that presents a FUSE
+filesystem backed by a real or emulated LTO tape drive using the
+[LTFS](https://www.ibm.com/docs/en/ts4300-tape-lib?topic=formats-linear-tape-file-system-ltfs)
+(Linear Tape File System) format.  It is composed of two programs:
+
+| Binary  | Role |
+|---------|------|
+| `ltaped` | Background daemon.  Holds open file handles to tape devices, serves the FUSE mount, and listens for commands on a Unix socket. |
+| `ltape`  | Thin CLI client.  Sends JSON-encoded commands to the daemon over the same socket and prints results. |
+
+---
+
+## Features
+
+- **LTFS 2.4.0** index/label format (XML, fully spec-compatible)
+- **File-backed simulation** — creates `.p0.dat` / `.p1.dat` partition images on
+  any filesystem; no tape drive required for development and testing
+- **Real SCSI tape** — reads and writes LTO and MHVTL virtual tape drives on
+  Linux using raw `MTIOCTOP` ioctls via `/dev/nst*`
+- **FUSE filesystem** — once a tape is loaded and mounted, the contents appear
+  as a normal directory; create, read, rename and delete operations are fully
+  supported
+- **Disk-cached index** — the LTFS index XML is never held only in RAM; it is
+  read from and written to `/tmp/ltape/index/<letter>.index` on every metadata
+  operation, so the cache is always consistent and survives daemon crashes
+- **Explicit commit** — file data is written to tape immediately on `close(2)`,
+  but the index must be committed separately; this mirrors how real tape drives
+  work and protects against index corruption
+- **Physical eject** — `ltape eject` unmounts the FUSE filesystem, waits for
+  the FUSE goroutine to exit, and issues the SCSI `MTOFFL` command to
+  physically retract the tape before removing the assignment
+- **Static binaries** — the CI workflow produces fully statically linked
+  `ltaped` and `ltape` with `CGO_ENABLED=0`
+
+---
+
+## Requirements
+
+| Dependency | Purpose |
+|------------|---------|
+| Linux kernel ≥ 3.x | FUSE (`/dev/fuse`) and tape ioctl support |
+| Go ≥ 1.22 | Build toolchain |
+| `fuse` kernel module | FUSE mounts (`modprobe fuse`) |
+| `mt-st`, `sg3-utils` | Optional: inspecting tape state outside tapefuse |
+| MHVTL | Optional: virtual tape library for integration testing |
+
+On real hardware, the tape drive must be accessible as `/dev/nst<N>` (no-rewind
+variant).  The file-backed mode works on any OS that supports FUSE (Linux and
+macOS with macFUSE), but the SCSI backend is Linux-only.
+
+---
+
+## Build
+
+```bash
+# Regular build (dynamically linked)
+go mod tidy
+go build ./...
+
+# Fully static binaries (recommended for deployment)
+CGO_ENABLED=0 go build -ldflags '-extldflags "-static"' -o ltaped ./cmd/ltaped
+CGO_ENABLED=0 go build -ldflags '-extldflags "-static"' -o ltape  ./cmd/ltape
+```
+
+---
+
+## Quick Start
+
+### Using a tape image (no physical drive needed)
+
+```bash
+# 1. Start the daemon (in the background or a separate terminal)
+./ltaped &
+
+# 2. Assign a device path to a short letter.
+#    For file-backed mode, use any non-existent path prefix.
+#    ltaped will create <path>.p0.dat and <path>.p1.dat automatically.
+./ltape assign /tmp/mytape a
+
+# 3. Initialize (format) the tape image
+./ltape init a
+
+# 4. Load the LTFS index from the tape image into the disk cache
+./ltape load a
+
+# 5. Mount the filesystem
+mkdir -p /mnt/tape
+./ltape mount a /mnt/tape
+
+# 6. Use it like any directory
+cp myfile.txt /mnt/tape/
+ls /mnt/tape/
+
+# 7. Commit: write the updated index back to the tape image
+./ltape commit a
+
+# 8. Unmount
+./ltape umount a
+
+# 9. Clean up the assignment
+./ltape unassign a
+```
+
+### Using a real / MHVTL tape drive
+
+```bash
+./ltaped &
+
+./ltape assign /dev/nst0 a   # ltaped detects the char device automatically
+./ltape init   a             # writes VOL1 + LTFS label + empty index to tape
+./ltape load   a             # reads index back into disk cache
+mkdir -p /mnt/tape
+./ltape mount  a /mnt/tape
+
+cp bigfile.iso /mnt/tape/
+./ltape commit a             # flush disk-cached index to tape
+./ltape umount a
+./ltape eject  a             # MTOFFL ioctl + remove assignment
+```
+
+---
+
+## Command Reference
+
+All commands are sent to `ltaped` via the Unix socket at
+`/tmp/ltape/ltaped.sock`.
+
+```
+ltape <command> [args]
+
+  assign  <device> <letter>    Register a device under a single-character letter.
+                                <device> may be:
+                                  • A path prefix for file-backed images, e.g.
+                                    /tmp/tape1  (creates /tmp/tape1.p0.dat and
+                                    /tmp/tape1.p1.dat)
+                                  • A no-rewind SCSI tape device, e.g. /dev/nst0
+
+  unassign <letter>            Release a letter.  The tape must not be mounted.
+
+  init     <letter>            Format the tape: write a VOL1 ANSI label, LTFS
+                                partition labels, and an empty LTFS index.
+                                Destroys all existing content.
+
+  load     <letter>            Open the tape partitions, read the LTFS index
+                                from block 3 of the index partition, and write
+                                it to the disk cache at
+                                /tmp/ltape/index/<letter>.index.
+
+  commit   <letter>            Read the disk-cached index and write it to the
+                                tape (rewind to block 3, overwrite, write double
+                                filemark).  Increments the generation number.
+
+  discard  <letter>            Close the tape partitions and delete the
+                                disk-cached index without writing to tape.
+                                Use this to abandon uncommitted changes.
+
+  mount    <letter> <mountpoint>
+                               Mount the tape as a FUSE filesystem.  The daemon
+                               creates <mountpoint> if it does not exist.
+                               Requires load to have been run first.
+
+  umount   <letter>            Unmount the FUSE filesystem.
+
+  eject    <letter>            Unmount (if mounted), wait for the FUSE goroutine
+                                to exit, issue MTOFFL on SCSI devices, and
+                                remove the assignment.
+
+  list                         Print all assignments with their current status:
+                                  a: /dev/nst0  [loaded] (mounted at /mnt/tape)
+                                  b: /tmp/tape2 [not loaded]
+```
+
+### Flushing inside the mount
+
+Writing any data to the special file `/.tapefuse_flush` inside the mount point
+triggers an immediate index flush to tape (equivalent to `ltape commit`):
+
+```bash
+echo flush > /mnt/tape/.tapefuse_flush
+```
+
+---
+
+## Normal Workflow Summary
+
+```
+assign → init → load → mount → (use FS) → commit → umount → [eject / unassign]
+```
+
+After `mount`, file data written through the FUSE filesystem is committed to
+tape immediately when each file is closed.  The directory index (filenames,
+sizes, timestamps, extent locations) lives in the disk cache and must be
+committed with `ltape commit` or by writing to `/.tapefuse_flush`.
+
+---
+
+## Tape Layout
+
+tapefuse uses a single sequential layout for both backends.  Every
+block, including filemarks, is assigned a consecutive block number.
+
+```
+Block 0   Data   VOL1 label (80-byte ANSI label with barcode)
+Block 1   Data   LTFS label (XML, partition map + volumeUUID)
+Block 2   FM     Filemark  — end of label area
+Block 3   Data   LTFS index (XML)  ← always rewritten here on commit
+Block 4   FM     Filemark
+Block 5   FM     Filemark  — end of index region / start of data region
+Block 6   Data   First file's data
+Block 7   FM     Filemark
+Block 8   Data   Second file's data
+Block 9   FM     Filemark
+…
+Block N   EOD    End-of-data marker
+```
+
+For **file-backed images** this layout is split across two files:
+
+| File | Covers |
+|------|--------|
+| `<device>.p0.dat` | Blocks 0–5 (index partition) |
+| `<device>.p1.dat` | Blocks 6+ (data partition, local numbering starts at 0) |
+
+For **SCSI tape devices** the entire layout lives on a single tape.  The
+`SCSIRegionTape` wrapper translates between the local block numbers used by the
+higher-level code and global tape positions.
+
+---
+
+## Index Management
+
+The LTFS index is an XML document that records the complete directory tree,
+per-file metadata, and the location of every file's data on tape (expressed
+as a list of extents: partition, startBlock, byteOffset, byteCount).
+
+tapefuse intentionally avoids keeping the index in RAM:
+
+1. `load` / `init` reads the index XML from tape and writes it to
+   `/tmp/ltape/index/<letter>.index`.
+2. Every FUSE metadata operation (Attr, Lookup, ReadDir, Create, Mkdir,
+   Remove, Rename) reads the disk file, modifies it in memory, and writes it
+   back atomically (write to `.tmp`, then `rename`).
+3. `commit` reads the disk file, calls `TapeFS.FlushIndex`, which rewinds to
+   block 3, overwrites the old index, writes two filemarks, and increments the
+   generation number.  The updated index is also written back to disk.
+4. `discard` simply deletes the disk cache file.
+
+File **data** never passes through the index cache.  On `close(2)` the
+`FileHandle.Release` FUSE callback calls `TapeFS.AppendFileData` directly,
+which appends the data block to the tape's data partition and records the
+resulting extent in the disk-cached index.
+
+---
+
+## Backends
+
+### File-backed (`internal/tape.Partition`)
+
+The default mode when `<device>` is not a character device.  Two regular
+files (`<device>.p0.dat`, `<device>.p1.dat`) store records using a simple
+binary framing:
+
+```
+[4 bytes LE] record type  (0=data, 1=filemark, 0xFFFF=EOD)
+[4 bytes LE] data length
+[N bytes]    data
+```
+
+An in-memory block index (`[]int64`) maps block numbers to byte offsets for
+O(1) random access and O(1) truncation.  This backend is fully portable and
+is the primary target for unit tests.
+
+### SCSI tape (`internal/tape.SCSITape`, Linux only)
+
+When `<device>` is detected as a character device (`os.Stat` mode
+`ModeCharDevice`), the daemon opens `/dev/nst<N>` (no-rewind variant) and
+uses Linux tape ioctls via `golang.org/x/sys/unix`:
+
+| ioctl `MTIOCTOP` op | Used for |
+|---------------------|----------|
+| `MTREW`  | Rewind to BOT before reads and before writing index |
+| `MTFSF n` | Space forward n filemarks (seeking past filemark blocks) |
+| `MTFSR n` | Space forward n data records (seeking past data blocks) |
+| `MTWEOF n` | Write n filemarks |
+| `MTOFFL` | Rewind and eject the tape cartridge |
+
+`SCSITape` maintains a `blockTypes []RecordType` slice (populated by a
+sequential scan on `OpenSCSI`) that records whether each block is a data
+record or a filemark.  This is used to choose the correct space command
+when seeking to an arbitrary block number.
+
+A `SCSIRegionTape` wrapper provides the index (offset 0) and data (offset 6)
+views that the `TapeFS` layer expects.
+
+Non-Linux builds compile in a stub (`scsi_stub.go`) that returns an error from
+`OpenSCSI` / `CreateSCSI`, so the package builds cleanly everywhere.
+
+---
+
+## Source Layout
+
+```
+tapefuse/
+├── cmd/
+│   ├── ltape/         CLI client entry point
+│   └── ltaped/        Daemon entry point (socket + signal handling)
+├── fs/
+│   └── fs.go          FUSE filesystem (FS, Dir, File, FileHandle, FlushFile)
+│                      TapeFS backend (format, open, read/write data, flush index)
+├── internal/
+│   ├── daemon/
+│   │   ├── daemon.go  Daemon types, server loop, dispatch, closeEntry
+│   │   └── proto.go   Request / Response / EntryStatus JSON types + constants
+│   ├── ltfs/
+│   │   ├── index.go   LTFS index XML (parse, marshal, FindFile, etc.)
+│   │   └── label.go   LTFS label XML (parse, marshal)
+│   └── tape/
+│       ├── iface.go        Tape interface (ReadAt, WriteRecord, …, Eject)
+│       ├── open.go         IsCharDevice helper
+│       ├── partition.go    File-backed Tape implementation
+│       ├── scsi_linux.go   SCSITape + SCSIRegionTape (Linux, public API)
+│       └── scsi_stub.go    Non-Linux stubs
+├── go.mod
+└── go.sum
+```
+
+---
+
+## IPC Protocol
+
+`ltaped` listens on the Unix domain socket `/tmp/ltape/ltaped.sock`.  Each
+connection carries one or more newline-delimited JSON messages.
+
+**Request:**
+```json
+{"cmd": "mount", "args": ["a", "/mnt/tape"]}
+```
+
+**Response (success):**
+```json
+{"ok": true}
+```
+
+**Response (list):**
+```json
+{
+  "ok": true,
+  "entries": [
+    {"letter": "a", "device": "/dev/nst0", "loaded": true,  "mountpoint": "/mnt/tape"},
+    {"letter": "b", "device": "/tmp/img2",  "loaded": false, "mountpoint": ""}
+  ]
+}
+```
+
+**Response (error):**
+```json
+{"ok": false, "error": "letter \"a\" not assigned"}
+```
+
+---
+
+## Testing
+
+```bash
+# Unit tests (no tape drive required)
+go test ./internal/tape/... ./internal/ltfs/...
+
+# All tests
+go test ./...
+
+# Integration test against a real / MHVTL tape device
+TAPEFUSE_TEST_DEVICE=/dev/nst0 go test -v -run TestMHVTL ./internal/tape/...
+```
+
+The `TestMHVTL` test is automatically skipped when
+`TAPEFUSE_TEST_DEVICE` is not set.
+
+### MHVTL (virtual tape library)
+
+[MHVTL](https://github.com/markh794/mhvtl) emulates a complete tape library
+including robot and drives as real SCSI devices visible to the kernel.
+
+```bash
+# Install (Ubuntu/Debian)
+sudo apt-get install mhvtl mt-st sg3-utils
+
+# Load the kernel module
+sudo modprobe mhvtl
+
+# Start the virtual tape daemon
+sudo vxd
+
+# Confirm devices
+ls /dev/st* /dev/nst*
+
+# Run the integration test
+TAPEFUSE_TEST_DEVICE=/dev/nst0 go test -v -run TestMHVTL ./internal/tape/...
+```
+
+---
+
+## CI
+
+The GitHub Actions workflow (`.github/workflows/build-test.yml`) runs on
+every push and pull request:
+
+| Job | What it does |
+|-----|-------------|
+| `build-test` | Downloads dependencies, builds static `ltaped` and `ltape`, runs unit tests, runs `go vet`, uploads both binaries as a single `ltape-binaries` artifact |
+| `mhvtl-test` | Installs MHVTL, starts the virtual tape daemon, runs `TestMHVTL` if a device appears; marked `continue-on-error: true` because kernel modules may not be available on all CI runners |
+
+---
+
+## Design Notes
+
+**Why disk-cached index?**  
+Keeping the LTFS index only on tape would require a full tape rewind and
+sequential read on every directory listing.  Keeping it only in RAM risks
+index loss on daemon crash.  The disk cache gives fast access while keeping
+the RAM footprint minimal: the XML is loaded, modified, and written back as a
+single atomic file operation per metadata call.
+
+**Why explicit commit?**  
+Tape drives are write-once sequential media.  Appending a new index on every
+file close would rapidly consume the tape.  Batching index writes (commit)
+matches how both LTFS reference implementations and real tape software behave.
+
+**Why two partition files for the file backend?**  
+LTFS on LTO-5+ hardware uses SCSI medium partitions.  The two-file approach
+mirrors that structure and simplifies the higher-level `TapeFS` code, which
+always addresses the "index partition" and "data partition" independently.
+
+**Why no in-memory index in the FUSE layer?**  
+Caching the parsed index in the FUSE layer would create a coherency problem:
+`commit` reads the disk cache, and `FileHandle.Release` writes to it.  If the
+FUSE layer held a separate in-memory copy, a crash between a Release and a
+Commit could produce an index that referred to data blocks that were never
+actually written.  The disk-IO cost per metadata operation is negligible
+compared to tape seek latency.
