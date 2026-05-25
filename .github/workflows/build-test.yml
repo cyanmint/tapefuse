@@ -1,0 +1,53 @@
+name: Build and Test
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  build-test:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: Build ltaped
+        run: go build -v -o ltaped ./cmd/ltaped
+
+      - name: Build ltape
+        run: go build -v -o ltape ./cmd/ltape
+
+      - name: Run unit tests
+        run: go test -v ./internal/tape/... ./internal/ltfs/...
+
+      - name: Run all tests (short mode)
+        run: go test -v -short ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Upload ltaped artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ltaped
+          path: ltaped
+
+      - name: Upload ltape artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ltape
+          path: ltape

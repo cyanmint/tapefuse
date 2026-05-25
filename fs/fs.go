@@ -80,41 +80,14 @@ func OpenTape(device string) (*TapeFS, error) {
 		return nil, fmt.Errorf("tape image is incomplete for device %q", device)
 	}
 
-	idxPart, err := tape.Open(p0)
+	idxPart, dataPart, idxLabel, dataLabel, err := OpenTapePartitions(device)
 	if err != nil {
-		return nil, err
-	}
-	dataPart, err := tape.Open(p1)
-	if err != nil {
-		_ = idxPart.Close()
 		return nil, err
 	}
 
 	closeBoth := func() {
 		_ = idxPart.Close()
 		_ = dataPart.Close()
-	}
-
-	idxLabelRec, err := idxPart.ReadAt(1)
-	if err != nil {
-		closeBoth()
-		return nil, err
-	}
-	idxLabel, err := ltfs.ParseLabel(idxLabelRec.Data)
-	if err != nil {
-		closeBoth()
-		return nil, err
-	}
-
-	dataLabelRec, err := dataPart.ReadAt(1)
-	if err != nil {
-		closeBoth()
-		return nil, err
-	}
-	dataLabel, err := ltfs.ParseLabel(dataLabelRec.Data)
-	if err != nil {
-		closeBoth()
-		return nil, err
 	}
 
 	indexRec, err := idxPart.ReadAt(3)
@@ -128,14 +101,48 @@ func OpenTape(device string) (*TapeFS, error) {
 		return nil, err
 	}
 
-	return &TapeFS{
-		Device:         device,
-		IndexPartition: idxPart,
-		DataPartition:  dataPart,
-		IndexLabel:     idxLabel,
-		DataLabel:      dataLabel,
-		Index:          index,
-	}, nil
+	return NewTapeFSFromParts(device, idxPart, dataPart, idxLabel, dataLabel, index), nil
+}
+
+// OpenTapePartitions opens the two partition files for a device without reading the index.
+// It returns the two partitions and labels. The caller must Close both partitions.
+func OpenTapePartitions(device string) (*tape.Partition, *tape.Partition, *ltfs.Label, *ltfs.Label, error) {
+	p0 := device + ".p0.dat"
+	p1 := device + ".p1.dat"
+	idxPart, err := tape.Open(p0)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	dataPart, err := tape.Open(p1)
+	if err != nil {
+		_ = idxPart.Close()
+		return nil, nil, nil, nil, err
+	}
+	idxLabelRec, err := idxPart.ReadAt(1)
+	if err != nil {
+		_ = idxPart.Close()
+		_ = dataPart.Close()
+		return nil, nil, nil, nil, err
+	}
+	idxLabel, err := ltfs.ParseLabel(idxLabelRec.Data)
+	if err != nil {
+		_ = idxPart.Close()
+		_ = dataPart.Close()
+		return nil, nil, nil, nil, err
+	}
+	dataLabelRec, err := dataPart.ReadAt(1)
+	if err != nil {
+		_ = idxPart.Close()
+		_ = dataPart.Close()
+		return nil, nil, nil, nil, err
+	}
+	dataLabel, err := ltfs.ParseLabel(dataLabelRec.Data)
+	if err != nil {
+		_ = idxPart.Close()
+		_ = dataPart.Close()
+		return nil, nil, nil, nil, err
+	}
+	return idxPart, dataPart, idxLabel, dataLabel, nil
 }
 
 func formatTape(device string) (*TapeFS, error) {
@@ -238,6 +245,23 @@ func formatTape(device string) (*TapeFS, error) {
 		DataLabel:      dataLabel,
 		Index:          index,
 	}, nil
+}
+
+// NewTapeFSFromParts creates a TapeFS from already-opened partitions and a pre-loaded index.
+func NewTapeFSFromParts(device string, idxPart, dataPart *tape.Partition, idxLabel, dataLabel *ltfs.Label, index *ltfs.Index) *TapeFS {
+	return &TapeFS{
+		Device:         device,
+		IndexPartition: idxPart,
+		DataPartition:  dataPart,
+		IndexLabel:     idxLabel,
+		DataLabel:      dataLabel,
+		Index:          index,
+	}
+}
+
+// FormatTape initializes a new tape image at device, writing VOL1 + LTFS label + empty index.
+func FormatTape(device string) (*TapeFS, error) {
+	return formatTape(device)
 }
 
 func New(tapeFS *TapeFS) *FS {

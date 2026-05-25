@@ -4,6 +4,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"os"
 	"path"
 	"strings"
 	"time"
@@ -272,4 +273,26 @@ func TouchFile(file *File, ts string) {
 	file.ChangeTime = ts
 	file.ModifyTime = ts
 	file.AccessTime = ts
+}
+
+// LoadIndexFromFile reads an LTFS index from a disk cache file.
+func LoadIndexFromFile(path string) (*Index, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return ParseIndex(data)
+}
+
+// SaveIndexToFile writes an LTFS index to a disk cache file atomically.
+func SaveIndexToFile(path string, idx *Index) error {
+	data, err := idx.Marshal()
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
