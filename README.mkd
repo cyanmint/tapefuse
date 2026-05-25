@@ -167,7 +167,8 @@ ltape <command> [args]
 
   eject    <letter>            Unmount (if mounted), wait for the FUSE goroutine
                                 to exit, issue MTOFFL on SCSI devices, and
-                                remove the assignment.
+                                close open handles.  The letter assignment is
+                                kept so you can swallow the tape back later.
 
   swallow  <letter>            Issue MTLOAD on SCSI devices to load media that
                                 was previously ejected; no-op for file-backed
@@ -192,7 +193,8 @@ echo flush > /mnt/tape/.tapefuse_flush
 ## Normal Workflow Summary
 
 ```
-assign → init → load → mount → (use FS) → commit → umount → [eject / unassign]
+assign → init → load → mount → (use FS) → commit → umount → eject → swallow → load → ...
+                                                                     └── unassign (to remove)
 ```
 
 After `mount`, file data written through the FUSE filesystem is committed to

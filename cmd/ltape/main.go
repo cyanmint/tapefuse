@@ -90,7 +90,7 @@ Commands:
   discard <letter>            discard disk cache index
   mount <letter> <mountpoint> mount tape filesystem
   umount <letter>             unmount tape filesystem
-  eject <letter>              eject tape
+  eject <letter>              eject tape (assignment is kept; use swallow to reload)
   swallow <letter>            load previously ejected tape
   list                        list assigned tapes and their status`)
 	os.Exit(1)

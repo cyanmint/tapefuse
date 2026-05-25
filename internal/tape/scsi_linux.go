@@ -5,6 +5,7 @@ package tape
 import (
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"sync"
 )
@@ -31,6 +32,7 @@ type SCSITape struct {
 	mu         sync.Mutex
 	f          *os.File
 	fd         int
+	device     string
 	blockTypes []RecordType
 	writePos   uint64
 }
@@ -72,7 +74,7 @@ func openSCSITape(device string) (*SCSITape, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &SCSITape{f: f, fd: int(f.Fd())}, nil
+	return &SCSITape{f: f, fd: int(f.Fd()), device: device}, nil
 }
 
 func SwallowSCSI(device string) error {
@@ -122,6 +124,7 @@ func (t *SCSITape) TruncateAt(blockNum uint64) error {
 	if blockNum > uint64(len(t.blockTypes)) {
 		return fmt.Errorf("block %d out of range", blockNum)
 	}
+	log.Printf("tape %s: erase: truncating at block %d (was %d blocks)", t.device, blockNum, len(t.blockTypes))
 	if err := t.positionToLocked(blockNum); err != nil {
 		return err
 	}
@@ -169,6 +172,7 @@ func (t *SCSITape) Eject() error {
 	if t.fd < 0 {
 		return nil
 	}
+	log.Printf("tape %s: issuing MTOFFL (eject)", t.device)
 	return ioctlMtop(t.fd, mtOFFL, 1)
 }
 
@@ -178,6 +182,7 @@ func (t *SCSITape) Swallow() error {
 	if t.fd < 0 {
 		return nil
 	}
+	log.Printf("tape %s: issuing MTLOAD (load media)", t.device)
 	return ioctlMtop(t.fd, mtLOAD, 1)
 }
 

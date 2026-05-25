@@ -238,9 +238,8 @@ func (d *Daemon) cmdEject(letter string) Response {
 		_ = e.idxPart.Eject()
 	}
 	d.closeEntry(e)
-	delete(d.entries, letter)
 	d.mu.Unlock()
-	d.logf("ejected and removed letter %s", letter)
+	d.logf("ejected tape for letter %s (assignment kept; use unassign to remove)", letter)
 	return Response{OK: true}
 }
 

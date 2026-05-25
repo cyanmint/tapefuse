@@ -5,6 +5,7 @@ package tape
 import (
 	"errors"
 	"io"
+	"log"
 	"path/filepath"
 	"strings"
 	"unsafe"
@@ -19,6 +20,7 @@ func (t *SCSITape) initialize(device string) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	log.Printf("tape %s: init: rewinding", t.device)
 	if err := ioctlMtop(t.fd, mtREW, 1); err != nil {
 		return err
 	}
@@ -38,26 +40,31 @@ func (t *SCSITape) initialize(device string) error {
 		return err
 	}
 
-	for _, rec := range []Record{
-		{Type: RecordData, Data: makeVOL1Label(device)},
-		{Type: RecordData, Data: idxLabelXML},
-	} {
-		if _, err := t.writeRecordLocked(rec); err != nil {
-			return err
-		}
+	log.Printf("tape %s: init: writing VOL1 label (%d bytes)", t.device, 80)
+	if _, err := t.writeRecordLocked(Record{Type: RecordData, Data: makeVOL1Label(device)}); err != nil {
+		return err
 	}
+	log.Printf("tape %s: init: writing LTFS index label (%d bytes)", t.device, len(idxLabelXML))
+	if _, err := t.writeRecordLocked(Record{Type: RecordData, Data: idxLabelXML}); err != nil {
+		return err
+	}
+	log.Printf("tape %s: init: writing filemark", t.device)
 	if _, err := t.writeFilemarkLocked(); err != nil {
 		return err
 	}
+	log.Printf("tape %s: init: writing LTFS index (%d bytes)", t.device, len(indexXML))
 	if _, err := t.writeRecordLocked(Record{Type: RecordData, Data: indexXML}); err != nil {
 		return err
 	}
+	log.Printf("tape %s: init: writing filemark", t.device)
 	if _, err := t.writeFilemarkLocked(); err != nil {
 		return err
 	}
+	log.Printf("tape %s: init: writing EOD filemark", t.device)
 	if _, err := t.writeFilemarkLocked(); err != nil {
 		return err
 	}
+	log.Printf("tape %s: init: syncing; tape initialized with %d blocks", t.device, len(t.blockTypes))
 	return t.f.Sync()
 }
 
@@ -65,6 +72,7 @@ func (t *SCSITape) scan() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	log.Printf("tape %s: scan: rewinding", t.device)
 	if err := ioctlMtop(t.fd, mtREW, 1); err != nil {
 		return err
 	}
@@ -80,6 +88,7 @@ func (t *SCSITape) scan() error {
 		t.blockTypes = append(t.blockTypes, rec.Type)
 	}
 	t.writePos = uint64(len(t.blockTypes))
+	log.Printf("tape %s: scan: complete, found %d blocks", t.device, len(t.blockTypes))
 	return nil
 }
 
@@ -93,6 +102,7 @@ func (t *SCSITape) writeRecordLocked(rec Record) (uint64, error) {
 	if err := t.positionToLocked(t.writePos); err != nil {
 		return 0, err
 	}
+	log.Printf("tape %s: write: data record at block %d (%d bytes)", t.device, t.writePos, len(rec.Data))
 	n, err := unix.Write(t.fd, rec.Data)
 	if err != nil {
 		return 0, err
@@ -113,6 +123,7 @@ func (t *SCSITape) writeFilemarkLocked() (uint64, error) {
 	if err := t.positionToLocked(t.writePos); err != nil {
 		return 0, err
 	}
+	log.Printf("tape %s: write: filemark at block %d", t.device, t.writePos)
 	if err := ioctlMtop(t.fd, mtWEOF, 1); err != nil {
 		return 0, err
 	}
@@ -126,6 +137,7 @@ func (t *SCSITape) writeFilemarkLocked() (uint64, error) {
 }
 
 func (t *SCSITape) positionToLocked(blockNum uint64) error {
+	log.Printf("tape %s: seek: rewind, then forward to block %d", t.device, blockNum)
 	if err := ioctlMtop(t.fd, mtREW, 1); err != nil {
 		return err
 	}
@@ -149,13 +161,16 @@ func (t *SCSITape) readOneLocked() (*Record, error) {
 	n, err := unix.Read(t.fd, buf)
 	if err != nil {
 		if errors.Is(err, unix.ENOSPC) || errors.Is(err, unix.ENODATA) || errors.Is(err, unix.EIO) {
+			log.Printf("tape %s: read: EOD/EOF", t.device)
 			return nil, io.EOF
 		}
 		return nil, err
 	}
 	if n == 0 {
+		log.Printf("tape %s: read: filemark", t.device)
 		return &Record{Type: RecordFilemark}, nil
 	}
+	log.Printf("tape %s: read: data block (%d bytes)", t.device, n)
 	return &Record{Type: RecordData, Data: append([]byte(nil), buf[:n]...)}, nil
 }
 
