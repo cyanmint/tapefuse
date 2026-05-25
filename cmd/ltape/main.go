@@ -6,9 +6,14 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 
 	"github.com/cyanmint/tapefuse/internal/daemon"
 )
+
+func verbosef(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "ltape: "+format+"\n", args...)
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -18,6 +23,7 @@ func main() {
 	cmd := os.Args[1]
 	args := os.Args[2:]
 
+	verbosef("connecting to %s", daemon.SocketPath)
 	conn, err := net.Dial("unix", daemon.SocketPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cannot connect to ltaped: %v\n", err)
@@ -26,6 +32,7 @@ func main() {
 	defer conn.Close()
 
 	req := daemon.Request{Cmd: cmd, Args: args}
+	verbosef("sending command %q with args [%s]", cmd, strings.Join(args, " "))
 	enc := json.NewEncoder(conn)
 	if err := enc.Encode(req); err != nil {
 		fmt.Fprintf(os.Stderr, "send: %v\n", err)
@@ -48,6 +55,7 @@ func main() {
 	}
 
 	if cmd == "list" {
+		verbosef("received %d tape assignment(s)", len(resp.Entries))
 		if len(resp.Entries) == 0 {
 			fmt.Println("no tapes assigned")
 			return
@@ -57,15 +65,16 @@ func main() {
 			if e.Loaded {
 				status = "loaded"
 			}
-			mount := ""
+			mount := "not mounted"
 			if e.MountPoint != "" {
-				mount = fmt.Sprintf(" (mounted at %s)", e.MountPoint)
+				mount = "mounted at " + e.MountPoint
 			}
-			fmt.Printf("%s: %s  [%s]%s\n", e.Letter, e.Device, status, mount)
+			fmt.Printf("%s: %s  [%s, %s]\n", e.Letter, e.Device, status, mount)
 		}
 		return
 	}
 
+	verbosef("command %q completed successfully", cmd)
 	fmt.Println("ok")
 }
 

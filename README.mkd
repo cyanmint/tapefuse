@@ -31,6 +31,8 @@ filesystem backed by a real or emulated LTO tape drive using the
 - **Physical eject** — `ltape eject` unmounts the FUSE filesystem, waits for
   the FUSE goroutine to exit, and issues the SCSI `MTOFFL` command to
   physically retract the tape before removing the assignment
+- **Verbose operation logs** — `ltaped` logs daemon lifecycle and command
+  handling; `ltape` prints request/response progress to stderr
 - **Static binaries** — the CI workflow produces fully statically linked
   `ltaped` and `ltape` with `CGO_ENABLED=0`
 
@@ -307,12 +309,15 @@ tapefuse/
 │   ├── ltape/         CLI client entry point
 │   └── ltaped/        Daemon entry point (socket + signal handling)
 ├── fs/
-│   └── fs.go          FUSE filesystem (FS, Dir, File, FileHandle, FlushFile)
-│                      TapeFS backend (format, open, read/write data, flush index)
+│   ├── fuse.go        FUSE-facing core types, FS constructor, interface assertions
+│   ├── tapefs.go      TapeFS backend (format, open, read/write data, flush index)
+│   ├── dir.go         Directory callbacks for bazil/fuse
+│   └── file.go        File and flush-file callbacks for bazil/fuse
 ├── internal/
 │   ├── daemon/
-│   │   ├── daemon.go  Daemon types, server loop, dispatch, closeEntry
-│   │   └── proto.go   Request / Response / EntryStatus JSON types + constants
+│   │   ├── daemon.go   Daemon types, server loop, request logging, dispatch
+│   │   ├── commands.go All ltape command handlers
+│   │   └── proto.go    Request / Response / EntryStatus JSON types + constants
 │   ├── ltfs/
 │   │   ├── index.go   LTFS index XML (parse, marshal, FindFile, etc.)
 │   │   └── label.go   LTFS label XML (parse, marshal)
@@ -320,7 +325,8 @@ tapefuse/
 │       ├── iface.go        Tape interface (ReadAt, WriteRecord, …, Eject)
 │       ├── open.go         IsCharDevice helper
 │       ├── partition.go    File-backed Tape implementation
-│       ├── scsi_linux.go   SCSITape + SCSIRegionTape (Linux, public API)
+│       ├── scsi_linux.go   SCSITape + SCSIRegionTape public Linux API
+│       ├── scsi_io_linux.go SCSI tape initialization, positioning, ioctl helpers
 │       └── scsi_stub.go    Non-Linux stubs
 ├── go.mod
 └── go.sum
