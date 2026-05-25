@@ -210,3 +210,7 @@ func (p *Partition) Close() error {
 func (p *Partition) Eject() error {
 	return nil
 }
+
+func (p *Partition) Swallow() error {
+	return nil
+}

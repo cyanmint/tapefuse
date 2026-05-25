@@ -10,6 +10,7 @@ import (
 
 	tapefs "github.com/cyanmint/tapefuse/fs"
 	"github.com/cyanmint/tapefuse/internal/ltfs"
+	"github.com/cyanmint/tapefuse/internal/tape"
 )
 
 func (d *Daemon) cmdAssign(device, letter string) Response {
@@ -231,13 +232,48 @@ func (d *Daemon) cmdEject(letter string) Response {
 		}
 		d.mu.Lock()
 	}
-	if e.idxPart != nil {
+	if e.dataPart != nil {
+		_ = e.dataPart.Eject()
+	} else if e.idxPart != nil {
 		_ = e.idxPart.Eject()
 	}
 	d.closeEntry(e)
 	delete(d.entries, letter)
 	d.mu.Unlock()
 	d.logf("ejected and removed letter %s", letter)
+	return Response{OK: true}
+}
+
+func (d *Daemon) cmdSwallow(letter string) Response {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	e, ok := d.entries[letter]
+	if !ok {
+		return Response{OK: false, Error: fmt.Sprintf("letter %q not assigned", letter)}
+	}
+	if e.mountPoint != "" {
+		return Response{OK: false, Error: "unmount before swallow"}
+	}
+	if e.dataPart != nil {
+		if err := e.dataPart.Swallow(); err != nil {
+			return Response{OK: false, Error: "swallow tape: " + err.Error()}
+		}
+		d.logf("swallowed tape for loaded letter %s", letter)
+		return Response{OK: true}
+	}
+
+	isChar, err := tape.IsCharDevice(e.device)
+	if err != nil {
+		return Response{OK: false, Error: err.Error()}
+	}
+	if !isChar {
+		d.logf("swallow requested for file-backed letter %s; no-op", letter)
+		return Response{OK: true}
+	}
+	if err := tape.SwallowSCSI(e.device); err != nil {
+		return Response{OK: false, Error: "swallow tape: " + err.Error()}
+	}
+	d.logf("swallowed tape for letter %s via device %s", letter, e.device)
 	return Response{OK: true}
 }
 

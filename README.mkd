@@ -169,6 +169,10 @@ ltape <command> [args]
                                 to exit, issue MTOFFL on SCSI devices, and
                                 remove the assignment.
 
+  swallow  <letter>            Issue MTLOAD on SCSI devices to load media that
+                                was previously ejected; no-op for file-backed
+                                assignments.
+
   list                         Print all assignments with their current status:
                                   a: /dev/nst0  [loaded] (mounted at /mnt/tape)
                                   b: /tmp/tape2 [not loaded]

@@ -13,9 +13,10 @@ const (
 	mtIoctlTop = 0x40086d01
 	mtFSF      = 1
 	mtFSR      = 3
-	mtWEOF     = 6
-	mtREW      = 7
-	mtOFFL     = 8
+	mtWEOF     = 5
+	mtREW      = 6
+	mtOFFL     = 7
+	mtLOAD     = 30
 
 	maxSCSIRecordSize = 512 * 1024
 	scsiDataOffset    = 6
@@ -72,6 +73,15 @@ func openSCSITape(device string) (*SCSITape, error) {
 		return nil, err
 	}
 	return &SCSITape{f: f, fd: int(f.Fd())}, nil
+}
+
+func SwallowSCSI(device string) error {
+	t, err := openSCSITape(device)
+	if err != nil {
+		return err
+	}
+	defer t.Close()
+	return t.Swallow()
 }
 
 func (t *SCSITape) ReadAt(blockNum uint64) (*Record, error) {
@@ -162,6 +172,15 @@ func (t *SCSITape) Eject() error {
 	return ioctlMtop(t.fd, mtOFFL, 1)
 }
 
+func (t *SCSITape) Swallow() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.fd < 0 {
+		return nil
+	}
+	return ioctlMtop(t.fd, mtLOAD, 1)
+}
+
 func (r *SCSIRegionTape) ReadAt(blockNum uint64) (*Record, error) {
 	return r.tape.ReadAt(r.offset + blockNum)
 }
@@ -237,6 +256,13 @@ func (r *SCSIRegionTape) Close() error {
 func (r *SCSIRegionTape) Eject() error {
 	if r.isOwner {
 		return r.tape.Eject()
+	}
+	return nil
+}
+
+func (r *SCSIRegionTape) Swallow() error {
+	if r.isOwner {
+		return r.tape.Swallow()
 	}
 	return nil
 }

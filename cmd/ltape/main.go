@@ -91,6 +91,7 @@ Commands:
   mount <letter> <mountpoint> mount tape filesystem
   umount <letter>             unmount tape filesystem
   eject <letter>              eject tape
+  swallow <letter>            load previously ejected tape
   list                        list assigned tapes and their status`)
 	os.Exit(1)
 }

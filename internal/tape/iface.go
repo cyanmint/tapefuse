@@ -13,4 +13,6 @@ type Tape interface {
 	Close() error
 	// Eject physically ejects the tape (no-op for file-based backends).
 	Eject() error
+	// Swallow loads previously ejected media (no-op for file-based backends).
+	Swallow() error
 }

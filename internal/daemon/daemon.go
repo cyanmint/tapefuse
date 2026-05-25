@@ -125,6 +125,11 @@ func (d *Daemon) dispatch(req Request) Response {
 			return Response{OK: false, Error: "eject requires <letter>"}
 		}
 		return d.cmdEject(req.Args[0])
+	case "swallow":
+		if len(req.Args) != 1 {
+			return Response{OK: false, Error: "swallow requires <letter>"}
+		}
+		return d.cmdSwallow(req.Args[0])
 	case "list":
 		if len(req.Args) != 0 {
 			return Response{OK: false, Error: "list takes no arguments"}
