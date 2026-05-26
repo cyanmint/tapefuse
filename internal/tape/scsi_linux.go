@@ -176,6 +176,17 @@ func (t *SCSITape) LastRecordType() (RecordType, bool, error) {
 	return t.blockTypes[len(t.blockTypes)-1], true, nil
 }
 
+// blockTypeAt returns the type of the physical block at the given index from the
+// in-memory scan table, without issuing any tape I/O.
+func (t *SCSITape) blockTypeAt(n uint64) (RecordType, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if n >= uint64(len(t.blockTypes)) {
+		return 0, false
+	}
+	return t.blockTypes[n], true
+}
+
 func (t *SCSITape) Sync() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -271,11 +282,17 @@ func (r *SCSIRegionTape) LastRecordType() (RecordType, bool, error) {
 	if count == 0 {
 		return 0, false, nil
 	}
-	rec, err := r.ReadAt(count - 1)
-	if err != nil {
-		return 0, false, err
+	// Read the block type from the in-memory scan table rather than issuing a
+	// physical tape read.  On real LTO drives, reading the second of two
+	// consecutive filemarks (the LTFS double-FM EOD marker) returns EIO, which
+	// our read path maps to io.EOF.  That error would propagate up through
+	// AppendFileData → FileHandle.Release and silently prevent the index from
+	// being updated, leaving all files after the first with Length=0.
+	bt, ok := r.tape.blockTypeAt(r.offset + count - 1)
+	if !ok {
+		return 0, false, nil
 	}
-	return rec.Type, true, nil
+	return bt, true, nil
 }
 
 func (r *SCSIRegionTape) Sync() error {
