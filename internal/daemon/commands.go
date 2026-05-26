@@ -389,8 +389,11 @@ func parseBufferConfig(kindStr, sizeStr string) (tapefs.BufferConfig, error) {
 		kind = tapefs.BufferKindMemory
 	case "file":
 		kind = tapefs.BufferKindFile
+	case "stream":
+		kind = tapefs.BufferKindStream
+		return tapefs.BufferConfig{Kind: kind}, nil
 	default:
-		return tapefs.BufferConfig{}, fmt.Errorf("unknown buffer kind %q (want \"memory\" or \"file\")", kindStr)
+		return tapefs.BufferConfig{}, fmt.Errorf("unknown buffer kind %q (want \"memory\", \"file\", or \"stream\")", kindStr)
 	}
 	maxBytes, err := parseSize(sizeStr)
 	if err != nil {

@@ -1,11 +1,11 @@
 package fs_test
 
 import (
-"os"
-"testing"
+	"os"
+	"testing"
 
-tapefs "github.com/cyanmint/tapefuse/fs"
-"github.com/cyanmint/tapefuse/internal/ltfs"
+	tapefs "github.com/cyanmint/tapefuse/fs"
+	"github.com/cyanmint/tapefuse/internal/ltfs"
 )
 
 func TestMultiFileAppend(t *testing.T) {
@@ -78,5 +78,69 @@ t.Errorf("%s: data mismatch:\n got %q\nwant %q", orig.name, data, orig.data)
 } else {
 t.Logf("OK: %s read back correctly (%d bytes)", orig.name, len(data))
 }
+}
+}
+
+// TestStreamingWriteMultipleExtents verifies that streaming-mode appends
+// produce multiple extents on tape (one per write chunk) and that all data
+// can be read back correctly after the extents are committed to the index.
+func TestStreamingWriteMultipleExtents(t *testing.T) {
+dir, err := os.MkdirTemp("", "tapefuse-stream-*")
+if err != nil {
+t.Fatal(err)
+}
+defer os.RemoveAll(dir)
+
+device := dir + "/tape"
+tfs, err := tapefs.FormatTape(device)
+if err != nil {
+t.Fatalf("FormatTape: %v", err)
+}
+
+idx, err := tfs.ReadIndexFromTape()
+if err != nil {
+t.Fatalf("ReadIndexFromTape: %v", err)
+}
+
+// Create a file entry in the index.
+uid := idx.NextFileUID()
+file := ltfs.NewFile("stream.bin", uid)
+idx.Root.Contents.Files = append(idx.Root.Contents.Files, file)
+filePtr := &idx.Root.Contents.Files[len(idx.Root.Contents.Files)-1]
+
+// Simulate streaming writes: three separate chunks appended to tape.
+chunks := [][]byte{
+[]byte("chunk-one:"),
+[]byte("chunk-two:"),
+[]byte("chunk-three"),
+}
+var offset int64
+for _, chunk := range chunks {
+extent, err := tfs.AppendFileData(chunk)
+if err != nil {
+	t.Fatalf("AppendFileData: %v", err)
+}
+extent.FileOffset = offset
+filePtr.ExtentInfo.Extents = append(filePtr.ExtentInfo.Extents, extent)
+offset += int64(len(chunk))
+}
+filePtr.Length = offset
+t.Logf("wrote %d chunks, total length %d, %d extents", len(chunks), filePtr.Length, len(filePtr.ExtentInfo.Extents))
+
+// Verify all extents are distinct blocks.
+if len(filePtr.ExtentInfo.Extents) != len(chunks) {
+t.Fatalf("got %d extents, want %d", len(filePtr.ExtentInfo.Extents), len(chunks))
+}
+
+// Read back the full file via ReadFileData.
+data, err := tfs.ReadFileData(filePtr)
+if err != nil {
+t.Fatalf("ReadFileData: %v", err)
+}
+want := "chunk-one:chunk-two:chunk-three"
+if string(data) != want {
+t.Errorf("data mismatch:\n got %q\nwant %q", string(data), want)
+} else {
+t.Logf("OK: read back %d bytes correctly", len(data))
 }
 }

@@ -150,6 +150,38 @@ func (h *FileHandle) Write(_ context.Context, req *fuse.WriteRequest, resp *fuse
 
 	end := req.Offset + int64(len(req.Data))
 
+	// Stream mode: bypass the write buffer and append data directly to tape.
+	if h.fs.bufCfg.Kind == BufferKindStream {
+		h.fs.mu.Lock()
+		defer h.fs.mu.Unlock()
+
+		idx, err := h.fs.loadIndex()
+		if err != nil {
+			return fuse.EIO
+		}
+		file, parent, err := idx.FindFile(h.path)
+		if err != nil {
+			return fuse.ENOENT
+		}
+		extent, err := h.fs.tape.AppendFileData(req.Data)
+		if err != nil {
+			return fuse.EIO
+		}
+		extent.FileOffset = req.Offset
+		file.ExtentInfo.Extents = append(file.ExtentInfo.Extents, extent)
+		if end > file.Length {
+			file.Length = end
+			now := ltfs.Now()
+			ltfs.TouchFile(file, now)
+			ltfs.TouchDirectory(parent, now)
+		}
+		if err := h.fs.saveIndex(idx); err != nil {
+			return fuse.EIO
+		}
+		resp.Size = len(req.Data)
+		return nil
+	}
+
 	// On the first write, initialise the write buffer.  For an existing
 	// non-empty file this also pre-loads the current tape content so that
 	// writes at any offset are handled correctly.  Done outside h.mu to avoid

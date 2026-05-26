@@ -233,10 +233,10 @@ func daemonOff() {
 }
 
 // parseMountArgs parses the CLI arguments for the "mount" command.  It
-// extracts optional buffer flags (-m/-f/--memory/--file) and returns a
-// normalised 4-element slice: [letter, mountpoint, bufkind, bufsize] suitable
-// for the daemon protocol.  When no flag is supplied the defaults (file, 0)
-// are used.
+// extracts optional buffer flags (-m/-f/--memory/--file/-s/--stream) and
+// returns a normalised 4-element slice: [letter, mountpoint, bufkind, bufsize]
+// suitable for the daemon protocol.  When no flag is supplied the defaults
+// (file, 0) are used.
 //
 // Supported flag forms:
 //
@@ -244,6 +244,8 @@ func daemonOff() {
 //	--memory=<size>  in-memory buffer, e.g. --memory=1G
 //	-f<size>         file-backed buffer, e.g. -f4G (0 = no limit)
 //	--file=<size>    file-backed buffer, e.g. --file=4G
+//	-s               streaming mode (write directly to tape)
+//	--stream         streaming mode (write directly to tape)
 func parseMountArgs(args []string) ([]string, error) {
 	kind := "file"
 	size := "0" // default: no limit
@@ -257,6 +259,9 @@ func parseMountArgs(args []string) ([]string, error) {
 		case strings.HasPrefix(a, "--file="):
 			kind = "file"
 			size = strings.TrimPrefix(a, "--file=")
+		case a == "--stream" || a == "-s":
+			kind = "stream"
+			size = "0"
 		case strings.HasPrefix(a, "-m"):
 			kind = "memory"
 			size = strings.TrimPrefix(a, "-m")
@@ -304,13 +309,14 @@ Tape commands:
   load <letter>               read index from tape to disk cache
   commit <letter>             write index from disk cache to tape
   discard <letter>            discard disk cache index
-  mount [-m<size>|-f<size>] <letter> <mountpoint>
+  mount [-m<size>|-f<size>|-s] <letter> <mountpoint>
                               mount tape filesystem
                                 -m<size>  / --memory=<size>  use in-memory write buffer
                                 -f<size>  / --file=<size>    use file-backed write buffer
                                                              (in /tmp/ltape/buffer)
                                 size examples: 0 (no limit), 1G, 4G, 512M
                                 default: file-backed, no limit (-f0)
+                                -s        / --stream         write directly to tape (no buffer)
   umount <letter>             unmount tape filesystem
   eject <letter>              eject tape (assignment is kept; use swallow to reload)
   swallow <letter>            load previously ejected tape

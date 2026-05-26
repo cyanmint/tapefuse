@@ -23,6 +23,14 @@ const (
 
 	// BufferKindMemory keeps the write buffer in a heap-allocated byte slice.
 	BufferKindMemory
+
+	// BufferKindStream bypasses the write buffer entirely and writes each FUSE
+	// Write chunk directly to the tape data partition as it arrives.  This
+	// delivers maximum streaming throughput for large sequential copies but
+	// does not support random-offset writes: each chunk is appended to tape as
+	// a separate extent.  Reads after a streaming write are served from the
+	// tape itself (no local buffer is retained).
+	BufferKindStream
 )
 
 // BufferConfig controls per-file-handle write-buffer behaviour for an FS
