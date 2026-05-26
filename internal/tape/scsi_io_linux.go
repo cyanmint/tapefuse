@@ -26,6 +26,7 @@ func (t *SCSITape) initialize(device string) error {
 	}
 	t.blockTypes = nil
 	t.writePos = 0
+	t.tapPos = 0 // tape head is now at BOT
 
 	volumeUUID := uuid.NewString()
 	idxLabel := ltfs.NewLabel("a", volumeUUID)
@@ -77,6 +78,7 @@ func (t *SCSITape) scan() error {
 		return err
 	}
 	t.blockTypes = t.blockTypes[:0]
+	t.tapPos = 0
 	for {
 		rec, err := t.readOneLocked()
 		if err != nil {
@@ -99,15 +101,20 @@ func (t *SCSITape) writeRecordLocked(rec Record) (uint64, error) {
 	if rec.Type != RecordData {
 		return 0, errors.New("unsupported record type")
 	}
-	if err := t.positionToLocked(t.writePos); err != nil {
-		return 0, err
+	// Only seek if the tape head is not already at the write position.
+	if t.tapPos != t.writePos {
+		if err := t.positionToLocked(t.writePos); err != nil {
+			return 0, err
+		}
 	}
 	log.Printf("tape %s: write: data record at block %d (%d bytes)", t.device, t.writePos, len(rec.Data))
 	n, err := unix.Write(t.fd, rec.Data)
 	if err != nil {
+		t.tapPos = unknownTapePos
 		return 0, err
 	}
 	if n != len(rec.Data) {
+		t.tapPos = unknownTapePos
 		return 0, io.ErrShortWrite
 	}
 	blockNum := t.writePos
@@ -115,16 +122,21 @@ func (t *SCSITape) writeRecordLocked(rec Record) (uint64, error) {
 		t.blockTypes = t.blockTypes[:blockNum]
 	}
 	t.blockTypes = append(t.blockTypes, RecordData)
+	t.tapPos = blockNum + 1
 	t.writePos++
 	return blockNum, nil
 }
 
 func (t *SCSITape) writeFilemarkLocked() (uint64, error) {
-	if err := t.positionToLocked(t.writePos); err != nil {
-		return 0, err
+	// Only seek if the tape head is not already at the write position.
+	if t.tapPos != t.writePos {
+		if err := t.positionToLocked(t.writePos); err != nil {
+			return 0, err
+		}
 	}
 	log.Printf("tape %s: write: filemark at block %d", t.device, t.writePos)
 	if err := ioctlMtop(t.fd, mtWEOF, 1); err != nil {
+		t.tapPos = unknownTapePos
 		return 0, err
 	}
 	blockNum := t.writePos
@@ -132,6 +144,7 @@ func (t *SCSITape) writeFilemarkLocked() (uint64, error) {
 		t.blockTypes = t.blockTypes[:blockNum]
 	}
 	t.blockTypes = append(t.blockTypes, RecordFilemark)
+	t.tapPos = blockNum + 1
 	t.writePos++
 	return blockNum, nil
 }
@@ -139,19 +152,24 @@ func (t *SCSITape) writeFilemarkLocked() (uint64, error) {
 func (t *SCSITape) positionToLocked(blockNum uint64) error {
 	log.Printf("tape %s: seek: rewind, then forward to block %d", t.device, blockNum)
 	if err := ioctlMtop(t.fd, mtREW, 1); err != nil {
+		t.tapPos = unknownTapePos
 		return err
 	}
+	t.tapPos = 0
 	for i := uint64(0); i < blockNum && i < uint64(len(t.blockTypes)); i++ {
 		switch t.blockTypes[i] {
 		case RecordFilemark:
 			if err := ioctlMtop(t.fd, mtFSF, 1); err != nil {
+				t.tapPos = unknownTapePos
 				return err
 			}
 		default:
 			if err := ioctlMtop(t.fd, mtFSR, 1); err != nil {
+				t.tapPos = unknownTapePos
 				return err
 			}
 		}
+		t.tapPos++
 	}
 	return nil
 }
@@ -164,13 +182,16 @@ func (t *SCSITape) readOneLocked() (*Record, error) {
 			log.Printf("tape %s: read: EOD/EOF", t.device)
 			return nil, io.EOF
 		}
+		t.tapPos = unknownTapePos
 		return nil, err
 	}
 	if n == 0 {
 		log.Printf("tape %s: read: filemark", t.device)
+		t.tapPos++
 		return &Record{Type: RecordFilemark}, nil
 	}
 	log.Printf("tape %s: read: data block (%d bytes)", t.device, n)
+	t.tapPos++
 	return &Record{Type: RecordData, Data: append([]byte(nil), buf[:n]...)}, nil
 }
 

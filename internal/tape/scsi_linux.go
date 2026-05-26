@@ -31,6 +31,9 @@ type mtop struct {
 	Count int32
 }
 
+// unknownTapePos is a sentinel for tapPos meaning "position not tracked".
+const unknownTapePos = ^uint64(0)
+
 type SCSITape struct {
 	mu         sync.Mutex
 	f          *os.File
@@ -38,6 +41,11 @@ type SCSITape struct {
 	device     string
 	blockTypes []RecordType
 	writePos   uint64
+	// tapPos tracks the current physical tape-head position so that
+	// sequential writes and reads can skip the expensive MTREW+FSR seek.
+	// Set to unknownTapePos when position is uncertain (e.g. after open
+	// before any explicit rewind, or after an error).
+	tapPos uint64
 }
 
 type SCSIRegionTape struct {
@@ -80,7 +88,7 @@ func openSCSITape(device string) (*SCSITape, error) {
 		}
 		return nil, err
 	}
-	return &SCSITape{f: f, fd: int(f.Fd()), device: device}, nil
+	return &SCSITape{f: f, fd: int(f.Fd()), device: device, tapPos: unknownTapePos}, nil
 }
 
 // openSCSITapeNonBlocking opens the tape device with O_NONBLOCK so the call
@@ -92,7 +100,7 @@ func openSCSITapeNonBlocking(device string) (*SCSITape, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open tape device %s: %w", device, err)
 	}
-	return &SCSITape{f: f, fd: int(f.Fd()), device: device}, nil
+	return &SCSITape{f: f, fd: int(f.Fd()), device: device, tapPos: unknownTapePos}, nil
 }
 
 func SwallowSCSI(device string) error {
@@ -111,8 +119,10 @@ func (t *SCSITape) ReadAt(blockNum uint64) (*Record, error) {
 	if blockNum >= uint64(len(t.blockTypes)) {
 		return nil, io.EOF
 	}
-	if err := t.positionToLocked(blockNum); err != nil {
-		return nil, err
+	if t.tapPos != blockNum {
+		if err := t.positionToLocked(blockNum); err != nil {
+			return nil, err
+		}
 	}
 	return t.readOneLocked()
 }
