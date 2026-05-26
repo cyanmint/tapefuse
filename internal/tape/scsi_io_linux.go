@@ -66,7 +66,8 @@ func (t *SCSITape) initialize(device string) error {
 		return err
 	}
 	log.Printf("tape %s: init: syncing; tape initialized with %d blocks", t.device, len(t.blockTypes))
-	return t.f.Sync()
+	// MTWEOF 0 flushes the drive write buffer without writing an additional filemark.
+	return ioctlMtop(t.fd, mtWEOF, 0)
 }
 
 func (t *SCSITape) scan() error {

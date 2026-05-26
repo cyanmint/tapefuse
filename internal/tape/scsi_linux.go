@@ -179,7 +179,10 @@ func (t *SCSITape) LastRecordType() (RecordType, bool, error) {
 func (t *SCSITape) Sync() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.f.Sync()
+	// fsync(2) is not supported on SCSI tape character devices (returns EINVAL).
+	// MTWEOF with count 0 flushes the drive's write buffer without writing an
+	// additional filemark, which is the correct way to sync tape writes.
+	return ioctlMtop(t.fd, mtWEOF, 0)
 }
 
 func (t *SCSITape) Close() error {
