@@ -192,21 +192,32 @@ func (d *Daemon) cmdMount(letter, mountPoint string) Response {
 
 func (d *Daemon) cmdUmount(letter string) Response {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	e, ok := d.entries[letter]
 	if !ok {
+		d.mu.Unlock()
 		return Response{OK: false, Error: fmt.Sprintf("letter %q not assigned", letter)}
 	}
 	if e.mountPoint == "" {
+		d.mu.Unlock()
 		return Response{OK: false, Error: fmt.Sprintf("letter %q is not mounted", letter)}
 	}
 	if err := fuse.Unmount(e.mountPoint); err != nil {
+		d.mu.Unlock()
 		return Response{OK: false, Error: "unmount: " + err.Error()}
 	}
+	done := e.fuseDone
 	e.mountPoint = ""
 	e.fuseConn = nil
 	e.fuseFS = nil
 	e.fuseDone = nil
+	d.mu.Unlock()
+	// Wait for the FUSE serve goroutine to finish processing any in-flight
+	// requests (e.g. pending Flush/Release) before returning to the caller.
+	// This ensures that the index on disk is fully up-to-date before a
+	// subsequent "commit" reads it.
+	if done != nil {
+		<-done
+	}
 	d.logf("unmounted letter %s", letter)
 	return Response{OK: true}
 }
@@ -235,9 +246,22 @@ func (d *Daemon) cmdEject(letter string) Response {
 		d.mu.Lock()
 	}
 	if e.dataPart != nil {
-		_ = e.dataPart.Eject()
+		if err := e.dataPart.Eject(); err != nil {
+			d.logf("eject tape %s for letter %s: %v", e.device, letter, err)
+		}
 	} else if e.idxPart != nil {
-		_ = e.idxPart.Eject()
+		if err := e.idxPart.Eject(); err != nil {
+			d.logf("eject tape %s for letter %s: %v", e.device, letter, err)
+		}
+	} else {
+		// No open partition handles (tape was never loaded, or was previously
+		// ejected).  Try to eject via the raw device directly.
+		isChar, err := tape.IsCharDevice(e.device)
+		if err == nil && isChar {
+			if err := tape.EjectSCSI(e.device); err != nil {
+				d.logf("eject tape %s for letter %s via raw device: %v", e.device, letter, err)
+			}
+		}
 	}
 	d.closeEntry(e)
 	d.mu.Unlock()

@@ -15,3 +15,7 @@ func CreateSCSI(device string) (Tape, Tape, error) {
 func SwallowSCSI(device string) error {
 	return fmt.Errorf("SCSI tape devices are not supported on this platform: %s", device)
 }
+
+func EjectSCSI(device string) error {
+	return fmt.Errorf("SCSI tape devices are not supported on this platform: %s", device)
+}

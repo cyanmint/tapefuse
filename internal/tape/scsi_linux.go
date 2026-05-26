@@ -112,6 +112,18 @@ func SwallowSCSI(device string) error {
 	return t.Swallow()
 }
 
+// EjectSCSI opens the tape device non-blocking and sends MTOFFL (eject).
+// It is used when no Tape partition handle is currently open (e.g. the tape
+// was assigned but never loaded, or was previously ejected).
+func EjectSCSI(device string) error {
+	t, err := openSCSITapeNonBlocking(device)
+	if err != nil {
+		return err
+	}
+	defer t.Close()
+	return t.Eject()
+}
+
 func (t *SCSITape) ReadAt(blockNum uint64) (*Record, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()

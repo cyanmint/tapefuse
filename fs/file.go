@@ -99,10 +99,33 @@ func (h *FileHandle) Release(_ context.Context, _ *fuse.ReleaseRequest) error {
 	if !h.dirty {
 		return nil
 	}
-
+	// Flush() should have persisted the data already.  If it was skipped or
+	// failed, try one last time here.  FUSE does not wait for the RELEASE
+	// reply, so any error is silently swallowed by the kernel; this is
+	// best-effort only.
 	h.fs.mu.Lock()
 	defer h.fs.mu.Unlock()
+	_ = h.writeLocked()
+	return nil
+}
 
+func (h *FileHandle) Flush(_ context.Context, _ *fuse.FlushRequest) error {
+	if !h.dirty {
+		return nil
+	}
+	// FUSE_FLUSH is synchronous: the kernel waits for the reply before
+	// close() returns to the caller.  Writing here ensures that the data
+	// reaches the tape and the index is updated before cp (or any other
+	// writer) sees close() succeed.
+	h.fs.mu.Lock()
+	defer h.fs.mu.Unlock()
+	return h.writeLocked()
+}
+
+// writeLocked persists dirty data to tape and saves the updated index.
+// It must be called with h.fs.mu held for writing.
+// On full success it clears h.dirty so subsequent calls are no-ops.
+func (h *FileHandle) writeLocked() error {
 	idx, err := h.fs.loadIndex()
 	if err != nil {
 		return fuse.EIO
@@ -126,10 +149,10 @@ func (h *FileHandle) Release(_ context.Context, _ *fuse.ReleaseRequest) error {
 	}
 	ltfs.TouchFile(file, now)
 	ltfs.TouchDirectory(parent, now)
-	return h.fs.saveIndex(idx)
-}
-
-func (h *FileHandle) Flush(_ context.Context, _ *fuse.FlushRequest) error {
+	if err := h.fs.saveIndex(idx); err != nil {
+		return err
+	}
+	h.dirty = false
 	return nil
 }
 
