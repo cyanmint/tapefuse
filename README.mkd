@@ -3,12 +3,7 @@
 tapefuse is a Linux userspace daemon and CLI tool that presents a FUSE
 filesystem backed by a real or emulated LTO tape drive using the
 [LTFS](https://www.ibm.com/docs/en/ts4300-tape-lib?topic=formats-linear-tape-file-system-ltfs)
-(Linear Tape File System) format.  It is composed of two programs:
-
-| Binary  | Role |
-|---------|------|
-| `ltaped` | Background daemon.  Holds open file handles to tape devices, serves the FUSE mount, and listens for commands on a Unix socket. |
-| `ltape`  | Thin CLI client.  Sends JSON-encoded commands to the daemon over the same socket and prints results. |
+(Linear Tape File System) format.
 
 ---
 
