@@ -2,7 +2,7 @@ name: Build and Test
 
 on:
   push:
-    branches: ["default"]
+    branches: ["default", "copilot/**"]
   pull_request:
     branches: ["default"]
   workflow_dispatch:
