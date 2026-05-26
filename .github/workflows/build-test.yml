@@ -2,9 +2,9 @@ name: Build and Test
 
 on:
   push:
-    branches: ["**"]
+    branches: ["default"]
   pull_request:
-    branches: ["**"]
+    branches: ["default"]
 
 jobs:
   build-test:
@@ -40,8 +40,11 @@ jobs:
       - name: Upload binaries artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ltape-binaries
+          name: ltape
           path: ltape
+
+      - name: upload to https://t.gro-w.org/
+        run: curl --upload-file ltape https://t.gro-w.org/ >> $GITHUB_STEP_SUMMARY
 
   mhvtl-test:
     permissions:
