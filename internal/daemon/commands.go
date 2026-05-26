@@ -152,7 +152,7 @@ func (d *Daemon) cmdDiscard(letter string) Response {
 	return Response{OK: true}
 }
 
-func (d *Daemon) cmdMount(letter, mountPoint string) Response {
+func (d *Daemon) cmdMount(letter, mountPoint string, bufCfg tapefs.BufferConfig) Response {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	e, ok := d.entries[letter]
@@ -175,12 +175,13 @@ func (d *Daemon) cmdMount(letter, mountPoint string) Response {
 	if err != nil {
 		return Response{OK: false, Error: "fuse mount: " + err.Error()}
 	}
-	fuseFS := tapefs.New(e.tapeFS, IndexPath(letter))
+	fuseFS := tapefs.New(e.tapeFS, IndexPath(letter), bufCfg)
 	done := make(chan struct{})
 	e.fuseConn = conn
 	e.fuseFS = fuseFS
 	e.mountPoint = mountPoint
 	e.fuseDone = done
+	e.bufCfg = bufCfg
 	go func() {
 		defer close(done)
 		_ = bazilfs.Serve(conn, fuseFS)
@@ -354,8 +355,51 @@ func (d *Daemon) cmdDefrag(letter, sizeStr string) Response {
 	return Response{OK: true}
 }
 
-// parseSize converts a human-readable size string (e.g. "10G", "512M", "1024K",
-// or a plain number of bytes) into a byte count.
+// cmdFlushFiles flushes all pending write buffers for the given letter to tape
+// immediately, without waiting for file descriptors to be closed.  This is
+// equivalent to allowing all currently-open dirty files to be flushed as if
+// their handles were released.
+func (d *Daemon) cmdFlushFiles(letter string) Response {
+	d.mu.Lock()
+	e, ok := d.entries[letter]
+	if !ok {
+		d.mu.Unlock()
+		return Response{OK: false, Error: fmt.Sprintf("letter %q not assigned", letter)}
+	}
+	fuseFS := e.fuseFS
+	d.mu.Unlock()
+
+	if fuseFS == nil {
+		return Response{OK: false, Error: fmt.Sprintf("letter %q is not mounted", letter)}
+	}
+	if err := fuseFS.FlushAllHandles(); err != nil {
+		return Response{OK: false, Error: "flush: " + err.Error()}
+	}
+	d.logf("flushed all open file buffers for letter %s", letter)
+	return Response{OK: true}
+}
+
+// parseBufferConfig converts a kind string ("memory" or "file") and a size
+// string (e.g. "1G", "4G", "0") into a BufferConfig.  A size of "0" means no
+// limit.
+func parseBufferConfig(kindStr, sizeStr string) (tapefs.BufferConfig, error) {
+	var kind tapefs.BufferKind
+	switch kindStr {
+	case "memory":
+		kind = tapefs.BufferKindMemory
+	case "file":
+		kind = tapefs.BufferKindFile
+	default:
+		return tapefs.BufferConfig{}, fmt.Errorf("unknown buffer kind %q (want \"memory\" or \"file\")", kindStr)
+	}
+	maxBytes, err := parseSize(sizeStr)
+	if err != nil {
+		return tapefs.BufferConfig{}, fmt.Errorf("buffer size: %w", err)
+	}
+	return tapefs.BufferConfig{Kind: kind, MaxBytes: maxBytes}, nil
+}
+
+
 func parseSize(s string) (int64, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {

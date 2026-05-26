@@ -75,6 +75,15 @@ func main() {
 	defer conn.Close()
 
 	req := daemon.Request{Cmd: cmd, Args: args}
+	if cmd == "mount" {
+		var err error
+		args, err = parseMountArgs(args)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "mount: %s\n", err)
+			os.Exit(1)
+		}
+		req.Args = args
+	}
 	verbosef("sending command %q with args [%s]", cmd, strings.Join(args, " "))
 	enc := json.NewEncoder(conn)
 	if err := enc.Encode(req); err != nil {
@@ -223,6 +232,61 @@ func daemonOff() {
 	fmt.Printf("ltaped (pid %d) signalled to stop\n", pid)
 }
 
+// parseMountArgs parses the CLI arguments for the "mount" command.  It
+// extracts optional buffer flags (-m/-f/--memory/--file) and returns a
+// normalised 4-element slice: [letter, mountpoint, bufkind, bufsize] suitable
+// for the daemon protocol.  When no flag is supplied the defaults (file, 0)
+// are used.
+//
+// Supported flag forms:
+//
+//	-m<size>         in-memory buffer, e.g. -m1G  (0 = no limit)
+//	--memory=<size>  in-memory buffer, e.g. --memory=1G
+//	-f<size>         file-backed buffer, e.g. -f4G (0 = no limit)
+//	--file=<size>    file-backed buffer, e.g. --file=4G
+func parseMountArgs(args []string) ([]string, error) {
+	kind := "file"
+	size := "0" // default: no limit
+	var pos []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case strings.HasPrefix(a, "--memory="):
+			kind = "memory"
+			size = strings.TrimPrefix(a, "--memory=")
+		case strings.HasPrefix(a, "--file="):
+			kind = "file"
+			size = strings.TrimPrefix(a, "--file=")
+		case strings.HasPrefix(a, "-m"):
+			kind = "memory"
+			size = strings.TrimPrefix(a, "-m")
+			if size == "" {
+				i++
+				if i >= len(args) {
+					return nil, fmt.Errorf("-m requires a size argument (e.g. -m1G or -m0)")
+				}
+				size = args[i]
+			}
+		case strings.HasPrefix(a, "-f"):
+			kind = "file"
+			size = strings.TrimPrefix(a, "-f")
+			if size == "" {
+				i++
+				if i >= len(args) {
+					return nil, fmt.Errorf("-f requires a size argument (e.g. -f4G or -f0)")
+				}
+				size = args[i]
+			}
+		default:
+			pos = append(pos, a)
+		}
+	}
+	if len(pos) != 2 {
+		return nil, fmt.Errorf("mount requires <letter> <mountpoint>")
+	}
+	return append(pos, kind, size), nil
+}
+
 func usage() {
 	fmt.Fprintln(os.Stderr, `Usage: ltape <command> [args]
 
@@ -240,12 +304,19 @@ Tape commands:
   load <letter>               read index from tape to disk cache
   commit <letter>             write index from disk cache to tape
   discard <letter>            discard disk cache index
-  mount <letter> <mountpoint> mount tape filesystem
+  mount [-m<size>|-f<size>] <letter> <mountpoint>
+                              mount tape filesystem
+                                -m<size>  / --memory=<size>  use in-memory write buffer
+                                -f<size>  / --file=<size>    use file-backed write buffer
+                                                             (in /tmp/ltape/buffer)
+                                size examples: 0 (no limit), 1G, 4G, 512M
+                                default: file-backed, no limit (-f0)
   umount <letter>             unmount tape filesystem
   eject <letter>              eject tape (assignment is kept; use swallow to reload)
   swallow <letter>            load previously ejected tape
   list                        list assigned tapes and their status
   defrag <letter> [size]      compact tape by removing deleted-file gaps
-                              (default size limit for staging area: 10G)`)
+                              (default size limit for staging area: 10G)
+  flushfiles <letter>         flush all open file write buffers to tape immediately`)
 	os.Exit(1)
 }

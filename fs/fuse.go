@@ -9,11 +9,6 @@ import (
 	"github.com/cyanmint/tapefuse/internal/tape"
 )
 
-// writeBufferSize is the initial capacity for the per-file-handle write
-// buffer.  512 KiB matches the maximum SCSI tape block size supported here;
-// the buffer grows automatically for larger files.
-const writeBufferSize = 512 * 1024
-
 const flushFileName = ".tapefuse_flush"
 
 type TapeFS struct {
@@ -27,7 +22,12 @@ type TapeFS struct {
 type FS struct {
 	tape      *TapeFS
 	indexPath string
+	bufCfg    BufferConfig
 	mu        sync.RWMutex
+	// handlesMu protects the handles map.  Lock order: handlesMu is
+	// independent of mu; never hold both at the same time.
+	handlesMu sync.Mutex
+	handles   map[*FileHandle]struct{} // only handles with pending writes
 }
 
 type Dir struct {
@@ -43,10 +43,10 @@ type File struct {
 type FileHandle struct {
 	fs   *FS
 	path string
-	// mu protects buf and dirty.  Lock order: mu before fs.mu.
+	// mu protects wbuf and dirty.  Lock order: mu before fs.mu.
 	mu    sync.Mutex
-	buf   []byte // in-memory write buffer; nil means no writes pending
-	dirty bool   // true when buf has data not yet flushed to tape
+	wbuf  writeBuf // nil until first write; closed after a successful flush
+	dirty bool     // true when wbuf holds data not yet written to tape
 }
 
 type FlushFile struct {
@@ -57,8 +57,16 @@ type FlushHandle struct {
 	fs *FS
 }
 
-func New(tapeFS *TapeFS, indexPath string) *FS {
-	return &FS{tape: tapeFS, indexPath: indexPath}
+// New creates an FS backed by tapeFS.  cfg controls per-file-handle write
+// buffering; pass DefaultBufferConfig() for the default (file-backed,
+// unlimited).
+func New(tapeFS *TapeFS, indexPath string, cfg BufferConfig) *FS {
+	return &FS{
+		tape:      tapeFS,
+		indexPath: indexPath,
+		bufCfg:    cfg,
+		handles:   make(map[*FileHandle]struct{}),
+	}
 }
 
 func (f *FS) Root() (bazilfs.Node, error) {
@@ -76,7 +84,56 @@ func (f *FS) saveIndex(idx *ltfs.Index) error {
 func (f *FS) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Defensively clean up any handles that were not released before Close.
+	f.handlesMu.Lock()
+	for h := range f.handles {
+		h.mu.Lock()
+		if h.wbuf != nil {
+			_ = h.wbuf.Close()
+			h.wbuf = nil
+		}
+		h.dirty = false
+		h.mu.Unlock()
+	}
+	f.handles = make(map[*FileHandle]struct{})
+	f.handlesMu.Unlock()
 	return f.tape.Close()
+}
+
+// addHandle registers h in the dirty-handle set.  Called when the first write
+// initialises a wbuf for h.
+func (f *FS) addHandle(h *FileHandle) {
+	f.handlesMu.Lock()
+	f.handles[h] = struct{}{}
+	f.handlesMu.Unlock()
+}
+
+// removeHandle removes h from the dirty-handle set after a successful flush.
+func (f *FS) removeHandle(h *FileHandle) {
+	f.handlesMu.Lock()
+	delete(f.handles, h)
+	f.handlesMu.Unlock()
+}
+
+// FlushAllHandles flushes every currently-dirty FileHandle to tape.  It is
+// used by the "flushfiles" daemon command.  Each handle is flushed
+// independently; all handles are attempted even if one fails, and the first
+// error is returned.
+func (f *FS) FlushAllHandles() error {
+	f.handlesMu.Lock()
+	snapshot := make([]*FileHandle, 0, len(f.handles))
+	for h := range f.handles {
+		snapshot = append(snapshot, h)
+	}
+	f.handlesMu.Unlock()
+
+	var firstErr error
+	for _, h := range snapshot {
+		if err := h.flushBuffer(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 var (

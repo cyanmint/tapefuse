@@ -2,6 +2,7 @@ package fs
 
 import (
 	"context"
+	"errors"
 	"syscall"
 
 	"bazil.org/fuse"
@@ -85,25 +86,21 @@ func (f *File) Fsync(_ context.Context, _ *fuse.FsyncRequest) error {
 }
 
 // Read reads file data.  If there are pending buffered writes on this handle
-// (dirty=true), the data is served from the in-memory buffer.  Otherwise it
-// is read directly from tape.
+// (dirty=true), the data is served from the write buffer.  Otherwise it is
+// read directly from tape.
 func (h *FileHandle) Read(_ context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
 	if req.Offset < 0 {
 		return fuse.Errno(syscall.EINVAL)
 	}
 
 	h.mu.Lock()
-	if h.dirty {
-		defer h.mu.Unlock()
-		if req.Offset >= int64(len(h.buf)) {
-			resp.Data = []byte{}
-			return nil
+	if h.dirty && h.wbuf != nil {
+		data, err := h.wbuf.ReadRange(req.Offset, req.Size)
+		h.mu.Unlock()
+		if err != nil {
+			return fuse.EIO
 		}
-		end := req.Offset + int64(req.Size)
-		if end > int64(len(h.buf)) {
-			end = int64(len(h.buf))
-		}
-		resp.Data = append([]byte(nil), h.buf[req.Offset:end]...)
+		resp.Data = data
 		return nil
 	}
 	h.mu.Unlock()
@@ -128,20 +125,20 @@ func (h *FileHandle) Read(_ context.Context, req *fuse.ReadRequest, resp *fuse.R
 	return nil
 }
 
-// Write accumulates data in an in-memory buffer (per FileHandle).  No tape
-// I/O occurs here; the complete file is written as a single tape block when
-// the last file descriptor is closed (see flushBuffer, called from Flush and
-// Release).
+// Write accumulates data in a per-FileHandle write buffer (memory or file-
+// backed, depending on the mount's BufferConfig).  No tape I/O occurs here;
+// the complete file is written as a single tape block when the last file
+// descriptor is closed (see flushBuffer, called from Flush and Release).
 //
 // This strategy matches how LTFS and LTFSCopyGUI handle writes: buffer the
-// entire file in memory and write it in one large tape block.  Writing one
-// small block per FUSE write chunk (128 KB) would waste tape due to
-// inter-block gaps and reduces streaming performance.
+// entire file and write it in one large tape block.  Writing one small block
+// per FUSE write chunk (128 KB) wastes tape due to inter-block gaps and
+// prevents the drive from reaching streaming speed.
 //
-// On the first write to an existing non-empty file the current content is
-// pre-loaded from tape so that writes at arbitrary offsets are handled
-// correctly.  The disk-cached index Length is updated on each Write so that
-// stat() returns the correct size even before the data reaches tape.
+// On the first write to an existing non-empty file the current tape content
+// is pre-loaded into the buffer so that writes at arbitrary offsets are
+// handled correctly.  The disk-cached index Length is updated on each Write
+// so that stat() returns the correct size even before the data reaches tape.
 func (h *FileHandle) Write(_ context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
 	if req.Offset < 0 {
 		return fuse.Errno(syscall.EINVAL)
@@ -153,14 +150,15 @@ func (h *FileHandle) Write(_ context.Context, req *fuse.WriteRequest, resp *fuse
 
 	end := req.Offset + int64(len(req.Data))
 
-	// On the first write to an existing non-empty file, pre-load the current
-	// tape content so writes at any offset are handled correctly.  This is done
-	// outside h.mu to avoid holding the handle lock during tape I/O.
+	// On the first write, initialise the write buffer.  For an existing
+	// non-empty file this also pre-loads the current tape content so that
+	// writes at any offset are handled correctly.  Done outside h.mu to avoid
+	// holding the handle lock during tape I/O.
 	h.mu.Lock()
-	needsPreload := !h.dirty && h.buf == nil
+	needsInit := h.wbuf == nil
 	h.mu.Unlock()
 
-	if needsPreload {
+	if needsInit {
 		h.fs.mu.RLock()
 		idx, err := h.fs.loadIndex()
 		if err != nil {
@@ -183,20 +181,30 @@ func (h *FileHandle) Write(_ context.Context, req *fuse.WriteRequest, resp *fuse
 		h.fs.mu.RUnlock()
 
 		h.mu.Lock()
-		if h.buf == nil {
-			h.buf = existing
+		if h.wbuf == nil {
+			wbuf, err := newWriteBuf(h.fs.bufCfg, existing)
+			if err != nil {
+				h.mu.Unlock()
+				if errors.Is(err, syscall.ENOSPC) {
+					return fuse.Errno(syscall.ENOSPC)
+				}
+				return fuse.EIO
+			}
+			h.wbuf = wbuf
+			h.fs.addHandle(h)
 		}
 		h.mu.Unlock()
 	}
 
-	// Accumulate the write into the in-memory buffer.
+	// Accumulate the write into the buffer.
 	h.mu.Lock()
-	if end > int64(len(h.buf)) {
-		grown := make([]byte, end, max(end, writeBufferSize))
-		copy(grown, h.buf)
-		h.buf = grown
+	if err := h.wbuf.WriteAt(req.Data, req.Offset); err != nil {
+		h.mu.Unlock()
+		if errors.Is(err, syscall.ENOSPC) {
+			return fuse.Errno(syscall.ENOSPC)
+		}
+		return fuse.EIO
 	}
-	copy(h.buf[req.Offset:end], req.Data)
 	h.dirty = true
 	h.mu.Unlock()
 
@@ -225,36 +233,42 @@ func (h *FileHandle) Write(_ context.Context, req *fuse.WriteRequest, resp *fuse
 	return nil
 }
 
-// flushBuffer writes the complete in-memory buffer to tape as a single block
-// and updates the file's extent info in the disk-cached index.  It is a no-op
-// if no writes are pending.
+// flushBuffer writes the complete write-buffer contents to tape as a single
+// block and updates the file's extent info in the disk-cached index.  It is a
+// no-op if no writes are pending.
 //
-// On write failure the buffer is restored so that a subsequent Release call
-// can retry.
+// On tape-write failure the buffer is restored (see restoreWBuf) so that a
+// subsequent Release call can retry.
 func (h *FileHandle) flushBuffer() error {
 	h.mu.Lock()
-	if !h.dirty {
+	if !h.dirty || h.wbuf == nil {
 		h.mu.Unlock()
 		return nil
 	}
 	// Snapshot the buffer and optimistically mark as clean.  If the tape write
-	// fails we restore the buffer (see restoreBuffer).
-	data := h.buf
-	h.buf = nil
+	// fails we restore the buffer via restoreWBuf.
+	wbuf := h.wbuf
+	h.wbuf = nil
 	h.dirty = false
 	h.mu.Unlock()
 
 	h.fs.mu.Lock()
 	defer h.fs.mu.Unlock()
 
+	data, err := wbuf.Bytes()
+	if err != nil {
+		h.restoreWBuf(wbuf)
+		return fuse.EIO
+	}
+
 	idx, err := h.fs.loadIndex()
 	if err != nil {
-		h.restoreBuffer(data)
+		h.restoreWBuf(wbuf)
 		return fuse.EIO
 	}
 	file, parent, err := idx.FindFile(h.path)
 	if err != nil {
-		h.restoreBuffer(data)
+		_ = wbuf.Close()
 		return fuse.ENOENT
 	}
 
@@ -278,7 +292,7 @@ func (h *FileHandle) flushBuffer() error {
 		// Write the complete file as a single tape block.
 		extent, err := h.fs.tape.AppendFileData(data)
 		if err != nil {
-			h.restoreBuffer(data)
+			h.restoreWBuf(wbuf)
 			return err
 		}
 		extent.FileOffset = 0
@@ -292,16 +306,23 @@ func (h *FileHandle) flushBuffer() error {
 	if err := h.fs.saveIndex(idx); err != nil {
 		return fuse.EIO
 	}
+
+	_ = wbuf.Close()
+	h.fs.removeHandle(h)
 	return nil
 }
 
-// restoreBuffer puts data back into h.buf if no concurrent write has already
-// started a new buffer since the flush attempt.
-func (h *FileHandle) restoreBuffer(data []byte) {
+// restoreWBuf puts wbuf back into h if no concurrent write has already
+// started a new buffer since the flush attempt.  If a new buffer exists the
+// old wbuf is closed to free its resources.
+func (h *FileHandle) restoreWBuf(wbuf writeBuf) {
 	h.mu.Lock()
 	if !h.dirty {
-		h.buf = data
+		h.wbuf = wbuf
 		h.dirty = true
+	} else {
+		// A concurrent write started a new buffer; discard the failed one.
+		_ = wbuf.Close()
 	}
 	h.mu.Unlock()
 }

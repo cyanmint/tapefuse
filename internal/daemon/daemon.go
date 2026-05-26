@@ -25,6 +25,7 @@ type entry struct {
 	fuseConn   *fuse.Conn
 	mountPoint string
 	fuseDone   chan struct{}
+	bufCfg     tapefs.BufferConfig
 }
 
 type Daemon struct {
@@ -115,10 +116,18 @@ func (d *Daemon) dispatch(req Request) Response {
 		}
 		return d.cmdDiscard(req.Args[0])
 	case "mount":
-		if len(req.Args) != 2 {
-			return Response{OK: false, Error: "mount requires <letter> <mountpoint>"}
+		if len(req.Args) < 2 || len(req.Args) > 4 {
+			return Response{OK: false, Error: "mount requires <letter> <mountpoint> [bufkind bufsize]"}
 		}
-		return d.cmdMount(req.Args[0], req.Args[1])
+		bufCfg := tapefs.DefaultBufferConfig()
+		if len(req.Args) == 4 {
+			var err error
+			bufCfg, err = parseBufferConfig(req.Args[2], req.Args[3])
+			if err != nil {
+				return Response{OK: false, Error: "buffer config: " + err.Error()}
+			}
+		}
+		return d.cmdMount(req.Args[0], req.Args[1], bufCfg)
 	case "umount":
 		if len(req.Args) != 1 {
 			return Response{OK: false, Error: "umount requires <letter>"}
@@ -148,6 +157,11 @@ func (d *Daemon) dispatch(req Request) Response {
 			sizeStr = req.Args[1]
 		}
 		return d.cmdDefrag(req.Args[0], sizeStr)
+	case "flushfiles":
+		if len(req.Args) != 1 {
+			return Response{OK: false, Error: "flushfiles requires <letter>"}
+		}
+		return d.cmdFlushFiles(req.Args[0])
 	}
 	// Unreachable: ResolveCmd guarantees cmd is a known command.
 	return Response{OK: false, Error: "unknown command: " + cmd}

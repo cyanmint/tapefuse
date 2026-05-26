@@ -16,6 +16,7 @@ var KnownCmds = []string{
 	"eject", "swallow",
 	"list",
 	"defrag",
+	"flushfiles",
 }
 
 // ResolveCmd returns the canonical command name for input using unambiguous

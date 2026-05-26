@@ -22,19 +22,27 @@ filesystem backed by a real or emulated LTO tape drive using the
 - **FUSE filesystem** — once a tape is loaded and mounted, the contents appear
   as a normal directory; create, read, rename and delete operations are fully
   supported
-- **Realtime file I/O** — file data is buffered in memory per open file handle
-  and written to tape as a **single large block** when the file descriptor is
-  closed.  This matches the behaviour of LTFS and LTFSCopyGUI: writing one
-  block per file maximises streaming performance and avoids the inter-block
-  gaps that would result from writing many small 128 KB blocks (one per FUSE
-  write chunk).  Reads go directly to tape; during an open write the data is
-  served from the in-memory buffer.  Two flush strategies keep tape use
-  efficient:
+- **Realtime file I/O** — file data is buffered per open file handle (in memory
+  or in a temporary file under `/tmp/ltape/buffer/`, depending on the mount
+  option) and written to tape as a **single large block** when the file
+  descriptor is closed.  This matches the behaviour of LTFS and LTFSCopyGUI:
+  writing one block per file maximises streaming performance and avoids the
+  inter-block gaps that would result from writing many small 128 KB blocks (one
+  per FUSE write chunk).  Reads go directly to tape; during an open write the
+  data is served from the buffer.  Two flush strategies keep tape use efficient:
   - *New / truncated file*: the complete buffer is appended at the data
     partition EOD as a single block on close.
   - *Overwrite existing file*: the current tape content is pre-loaded into the
-    buffer on the first write, the writes are applied in memory, and the merged
-    result is written back as a single block on close (old extents are freed).
+    buffer on the first write, the writes are applied, and the merged result is
+    written back as a single block on close (old extents are freed).
+- **Configurable write buffers** — `ltape mount -f0 …` (default) uses a
+  temporary file in `/tmp/ltape/buffer/`; `-m0` uses heap memory; a size
+  suffix caps the per-file buffer (e.g. `-f4G`, `-m1G`); `0` means no limit.
+  File-backed buffers keep large write-staging data off the Go heap and let the
+  OS page it under memory pressure.
+- **Immediate flush** — `ltape flushfiles <letter>` flushes all currently-open
+  dirty file buffers to tape without waiting for the file descriptors to close,
+  useful for transferring files that remain open for a long time.
 - **Disk-cached index** — the LTFS index XML is never held only in RAM; it is
   read from and written to `/tmp/ltape/index/<letter>.index` on every metadata
   operation, so the cache is always consistent and survives daemon crashes
@@ -105,9 +113,11 @@ CGO_ENABLED=0 go build -ldflags '-extldflags "-static"' -o ltape  ./cmd/ltape
 # 4. Load the LTFS index from the tape image into the disk cache
 ./ltape load a
 
-# 5. Mount the filesystem
+# 5. Mount the filesystem (default: file-backed buffer, no size limit)
 mkdir -p /mnt/tape
 ./ltape mount a /mnt/tape
+# Or: in-memory buffer with 1 GiB cap:  ./ltape mount -m1G a /mnt/tape
+# Or: file-backed buffer with 4 GiB cap: ./ltape mount -f4G a /mnt/tape
 
 # 6. Use it like any directory — writes go to tape immediately
 cp myfile.txt /mnt/tape/
@@ -179,10 +189,21 @@ ltape <command> [args]
                                 disk-cached index without writing to tape.
                                 Use this to abandon uncommitted changes.
 
-  mount    <letter> <mountpoint>
+  mount [-m<size>|-f<size>] <letter> <mountpoint>
                                Mount the tape as a FUSE filesystem.  The daemon
                                creates <mountpoint> if it does not exist.
                                Requires load to have been run first.
+
+                               Buffer options (controls how write data is held
+                               before being flushed to tape on close):
+                                 -m<size> / --memory=<size>
+                                     In-memory (heap) write buffer.
+                                 -f<size> / --file=<size>
+                                     File-backed buffer in /tmp/ltape/buffer/
+                                     (default).
+                                 <size> is a byte count with optional suffix:
+                                 0 = no limit, 1G, 4G, 512M, etc.
+                                 Default (no flag): file-backed, no limit (-f0).
 
   umount   <letter>            Unmount the FUSE filesystem.
 
@@ -198,6 +219,10 @@ ltape <command> [args]
   list                         Print all assignments with their current status:
                                   a: /dev/nst0  [loaded] (mounted at /mnt/tape)
                                   b: /tmp/tape2 [not loaded]
+
+  flushfiles <letter>          Flush all currently-open dirty file write buffers
+                               to tape immediately, without waiting for file
+                               descriptors to be closed.
 ```
 
 ### Flushing inside the mount
