@@ -193,6 +193,25 @@ func (t *SCSITape) TruncateAt(blockNum uint64) error {
 	if err := t.positionToLocked(blockNum); err != nil {
 		return err
 	}
+	// When truncating at an EOD marker the next write would overwrite the
+	// existing EOD filemark on tape.  SCSI drives (including MHVTL) return
+	// persistent EBUSY for writes at interior positions reached via
+	// REWIND+FSR/FSF; only writes to blank tape are accepted.  Issue MTWEOF
+	// to physically write a new filemark at blockNum, which advances the
+	// write point one block into blank tape and leaves the drive in write
+	// mode, so the subsequent data write succeeds.
+	if blockNum < uint64(len(t.blockTypes)) && t.blockTypes[blockNum] == RecordEOD {
+		log.Printf("tape %s: erase: writing filemark at block %d to advance past EOD", t.device, blockNum)
+		if err := ioctlMtop(t.fd, mtWEOF, 1); err != nil {
+			t.tapPos = unknownTapePos
+			return err
+		}
+		t.blockTypes = t.blockTypes[:blockNum]
+		t.blockTypes = append(t.blockTypes, RecordFilemark)
+		t.tapPos = blockNum + 1
+		t.writePos = blockNum + 1
+		return nil
+	}
 	t.blockTypes = t.blockTypes[:blockNum]
 	t.writePos = blockNum
 	return nil

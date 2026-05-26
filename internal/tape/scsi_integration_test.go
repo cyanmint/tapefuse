@@ -62,7 +62,24 @@ func TestMHVTL(t *testing.T) {
 	t.Log("File 1 read back OK")
 
 	// --- Second file write (exercises AppendFileData removing the EOD before
-	//     writing, which is the scenario that previously caused EIO) ---
+	//     writing, which is the scenario that previously caused persistent
+	//     EBUSY on SCSI drives when the write attempted to overwrite an
+	//     existing EOD filemark at an interior tape position) ---
+	//
+	// Simulate the AppendFileData flow: detect the EOD, truncate at it (which
+	// on SCSI tape must issue MTWEOF to advance the write point past the EOD
+	// filemark into blank tape), then write the new file.
+	lastType, ok, err := dataTape.LastRecordType()
+	if err != nil {
+		t.Fatalf("LastRecordType: %v", err)
+	}
+	if !ok || lastType != tape.RecordEOD {
+		t.Fatalf("expected RecordEOD as last block type, got ok=%v type=%v", ok, lastType)
+	}
+	eodBlock := dataTape.BlockCount() - 1
+	if err := dataTape.TruncateAt(eodBlock); err != nil {
+		t.Fatalf("TruncateAt(EOD block %d): %v", eodBlock, err)
+	}
 	testData2 := []byte("second file on tape")
 	bn2, err := dataTape.WriteRecord(tape.Record{Type: tape.RecordData, Data: testData2})
 	if err != nil {
