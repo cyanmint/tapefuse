@@ -9,6 +9,11 @@ import (
 	"github.com/cyanmint/tapefuse/internal/tape"
 )
 
+// writeBufferSize is the initial capacity for the per-file-handle write
+// buffer.  512 KiB matches the maximum SCSI tape block size supported here;
+// the buffer grows automatically for larger files.
+const writeBufferSize = 512 * 1024
+
 const flushFileName = ".tapefuse_flush"
 
 type TapeFS struct {
@@ -38,6 +43,10 @@ type File struct {
 type FileHandle struct {
 	fs   *FS
 	path string
+	// mu protects buf and dirty.  Lock order: mu before fs.mu.
+	mu    sync.Mutex
+	buf   []byte // in-memory write buffer; nil means no writes pending
+	dirty bool   // true when buf has data not yet flushed to tape
 }
 
 type FlushFile struct {

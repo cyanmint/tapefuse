@@ -22,15 +22,19 @@ filesystem backed by a real or emulated LTO tape drive using the
 - **FUSE filesystem** — once a tape is loaded and mounted, the contents appear
   as a normal directory; create, read, rename and delete operations are fully
   supported
-- **Realtime file I/O** — file data is written to tape immediately on each
-  `write(2)` call (no in-memory write buffer); reads go directly to tape as
-  well.  Two write strategies keep tape use efficient:
-  - *Append* — writes at or beyond the current file end (including all writes
-    to new and truncated files) append a new tape block and add a new extent.
-  - *In-place edit* — writes within an existing file's content read the full
-    current file from tape, apply the patch, free the old block as reusable
-    space, and write a single merged block back (reusing the freed slot where
-    possible).
+- **Realtime file I/O** — file data is buffered in memory per open file handle
+  and written to tape as a **single large block** when the file descriptor is
+  closed.  This matches the behaviour of LTFS and LTFSCopyGUI: writing one
+  block per file maximises streaming performance and avoids the inter-block
+  gaps that would result from writing many small 128 KB blocks (one per FUSE
+  write chunk).  Reads go directly to tape; during an open write the data is
+  served from the in-memory buffer.  Two flush strategies keep tape use
+  efficient:
+  - *New / truncated file*: the complete buffer is appended at the data
+    partition EOD as a single block on close.
+  - *Overwrite existing file*: the current tape content is pre-loaded into the
+    buffer on the first write, the writes are applied in memory, and the merged
+    result is written back as a single block on close (old extents are freed).
 - **Disk-cached index** — the LTFS index XML is never held only in RAM; it is
   read from and written to `/tmp/ltape/index/<letter>.index` on every metadata
   operation, so the cache is always consistent and survives daemon crashes
@@ -462,14 +466,17 @@ Tape drives are write-once sequential media.  Appending a new index on every
 file write would rapidly consume the tape.  Batching index writes (commit)
 matches how both LTFS reference implementations and real tape software behave.
 
-**Why realtime file writes (no write buffer)?**  
-Buffering an entire file in RAM and writing it at `close(2)` time means that
-the `close()` call can fail with EIO if the tape write fails, which confuses
-many tools (e.g. `cp` reports "failed to close").  By writing each FUSE Write
-request directly to tape, errors surface in `write()` rather than `close()`,
-which is the expected POSIX behavior.  Each write appends a data block followed
-by a filemark and EOD marker directly to tape (no extra sync ioctl needed, as
-filemarks are written synchronously by the drive).
+**Why buffer writes per file handle (no immediate tape write)?**  
+Tape drives achieve maximum throughput when writing large, contiguous blocks.
+The Linux FUSE layer limits each `write(2)` call to 128 KB, so writing
+directly on each FUSE write would produce one tape block per chunk — wasting
+tape space due to inter-block gaps and preventing the drive from reaching
+streaming speed.  Instead, tapefuse accumulates each file's data in an
+in-memory buffer and writes the entire file as a single tape block when the
+file descriptor is closed.  This is the same strategy used by LTFS and
+LTFSCopyGUI.  For existing files, the current tape content is pre-loaded into
+the buffer on the first write so that partial overwrites are handled
+correctly.
 
 **Why two partition files for the file backend?**  
 LTFS on LTO-5+ hardware uses SCSI medium partitions.  The two-file approach
