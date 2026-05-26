@@ -90,6 +90,13 @@ func (t *SCSITape) scan() error {
 		}
 		t.blockTypes = append(t.blockTypes, rec.Type)
 	}
+	// The scan ends when reading hits the double-FM EOD (EIO on SCSI tape).
+	// The last filemark we successfully read is the physical EOD marker;
+	// relabel it as RecordEOD so AppendFileData can detect and remove it
+	// before writing the next file.
+	if len(t.blockTypes) > 0 && t.blockTypes[len(t.blockTypes)-1] == RecordFilemark {
+		t.blockTypes[len(t.blockTypes)-1] = RecordEOD
+	}
 	t.writePos = uint64(len(t.blockTypes))
 	log.Printf("tape %s: scan: complete, found %d blocks", t.device, len(t.blockTypes))
 	return nil
@@ -151,6 +158,20 @@ func (t *SCSITape) writeFilemarkLocked() (uint64, error) {
 }
 
 func (t *SCSITape) positionToLocked(blockNum uint64) error {
+	// Seeking to the write position means seeking to the physical EOD.
+	// Using MTEOM is more reliable than rewinding and forward-spacing because
+	// trying to SPACE past the double-FM EOD marker (the last filemark on
+	// tape) returns a CHECK CONDITION on real SCSI drives and on MHVTL.
+	if blockNum == t.writePos {
+		log.Printf("tape %s: seek: MTEOM to write position %d", t.device, blockNum)
+		if err := ioctlMtop(t.fd, mtEOM, 1); err != nil {
+			t.tapPos = unknownTapePos
+			return err
+		}
+		t.tapPos = blockNum
+		return nil
+	}
+
 	log.Printf("tape %s: seek: rewind, then forward to block %d", t.device, blockNum)
 	if err := ioctlMtop(t.fd, mtREW, 1); err != nil {
 		t.tapPos = unknownTapePos
@@ -159,7 +180,9 @@ func (t *SCSITape) positionToLocked(blockNum uint64) error {
 	t.tapPos = 0
 	for i := uint64(0); i < blockNum && i < uint64(len(t.blockTypes)); i++ {
 		switch t.blockTypes[i] {
-		case RecordFilemark:
+		case RecordFilemark, RecordEOD:
+			// Both regular filemarks and the EOD marker are physical filemarks
+			// on tape; use MTFSF to skip forward past them.
 			if err := ioctlMtop(t.fd, mtFSF, 1); err != nil {
 				t.tapPos = unknownTapePos
 				return err

@@ -25,7 +25,9 @@ func TestMHVTL(t *testing.T) {
 	defer idxTape.Close()
 	defer dataTape.Close()
 
-	testData := []byte("hello tape world")
+	// Read the index block from the index partition.  This moves the physical
+	// tape head away from the write position; the subsequent WriteRecord must
+	// re-position correctly via MTEOM.
 	rec, err := idxTape.ReadAt(3)
 	if err != nil {
 		t.Fatalf("ReadAt(3): %v", err)
@@ -35,18 +37,59 @@ func TestMHVTL(t *testing.T) {
 	}
 	t.Logf("Index block data length: %d bytes", len(rec.Data))
 
-	bn, err := dataTape.WriteRecord(tape.Record{Type: tape.RecordData, Data: testData})
+	// --- First file write ---
+	testData1 := []byte("hello tape world")
+	bn1, err := dataTape.WriteRecord(tape.Record{Type: tape.RecordData, Data: testData1})
 	if err != nil {
-		t.Fatalf("WriteRecord on data tape: %v", err)
+		t.Fatalf("WriteRecord (file 1) on data tape: %v", err)
 	}
-	t.Logf("Wrote data at data partition block %d", bn)
+	t.Logf("Wrote file 1 at data partition block %d", bn1)
+	if _, err := dataTape.WriteFilemark(); err != nil {
+		t.Fatalf("WriteFilemark (file 1): %v", err)
+	}
+	if _, err := dataTape.WriteEOD(); err != nil {
+		t.Fatalf("WriteEOD (file 1): %v", err)
+	}
 
-	rec2, err := dataTape.ReadAt(bn)
+	// Read back file 1.
+	rec1, err := dataTape.ReadAt(bn1)
 	if err != nil {
-		t.Fatalf("ReadAt on data tape: %v", err)
+		t.Fatalf("ReadAt (file 1): %v", err)
 	}
-	if string(rec2.Data) != string(testData) {
-		t.Fatalf("data mismatch: got %q, want %q", rec2.Data, testData)
+	if string(rec1.Data) != string(testData1) {
+		t.Fatalf("file 1 data mismatch: got %q, want %q", rec1.Data, testData1)
 	}
-	t.Log("MHVTL real tape test passed")
+	t.Log("File 1 read back OK")
+
+	// --- Second file write (exercises AppendFileData removing the EOD before
+	//     writing, which is the scenario that previously caused EIO) ---
+	testData2 := []byte("second file on tape")
+	bn2, err := dataTape.WriteRecord(tape.Record{Type: tape.RecordData, Data: testData2})
+	if err != nil {
+		t.Fatalf("WriteRecord (file 2) on data tape: %v", err)
+	}
+	t.Logf("Wrote file 2 at data partition block %d", bn2)
+	if _, err := dataTape.WriteFilemark(); err != nil {
+		t.Fatalf("WriteFilemark (file 2): %v", err)
+	}
+	if _, err := dataTape.WriteEOD(); err != nil {
+		t.Fatalf("WriteEOD (file 2): %v", err)
+	}
+
+	// Read back both files.
+	rec1again, err := dataTape.ReadAt(bn1)
+	if err != nil {
+		t.Fatalf("ReadAt (file 1 again): %v", err)
+	}
+	if string(rec1again.Data) != string(testData1) {
+		t.Fatalf("file 1 re-read mismatch: got %q, want %q", rec1again.Data, testData1)
+	}
+	rec2, err := dataTape.ReadAt(bn2)
+	if err != nil {
+		t.Fatalf("ReadAt (file 2): %v", err)
+	}
+	if string(rec2.Data) != string(testData2) {
+		t.Fatalf("file 2 data mismatch: got %q, want %q", rec2.Data, testData2)
+	}
+	t.Log("MHVTL real tape test passed (both files verified)")
 }

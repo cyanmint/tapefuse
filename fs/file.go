@@ -126,8 +126,8 @@ return nil
 //     back as a single new block via WriteFileData (which may reuse a freed
 //     block).
 //
-// After writing, the data partition is synced before the index is saved so
-// that a daemon crash cannot produce an index that references un-persisted data.
+// Each AppendFileData call writes a trailing filemark followed by the EOD
+// marker directly to tape, so all data is durable without an additional sync.
 func (h *FileHandle) Write(_ context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
 if req.Offset < 0 {
 return fuse.Errno(syscall.EINVAL)
@@ -150,12 +150,6 @@ return fuse.ENOENT
 }
 
 if err := h.fs.tape.WriteChunkToFile(file, req.Offset, req.Data, idx); err != nil {
-return err
-}
-
-// Sync data to durable storage BEFORE saving the index so that a crash
-// cannot leave the index referencing data blocks that were not persisted.
-if err := h.fs.tape.DataPartition.Sync(); err != nil {
 return err
 }
 

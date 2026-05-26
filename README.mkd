@@ -232,14 +232,16 @@ Block 1   Data   LTFS label (XML, partition map + volumeUUID)
 Block 2   FM     Filemark  — end of label area
 Block 3   Data   LTFS index (XML)  ← always rewritten here on commit
 Block 4   FM     Filemark
-Block 5   FM     Filemark  — end of index region / start of data region
+Block 5   EOD    End-of-data marker for the index region / start of data region
 Block 6   Data   First file's data
 Block 7   FM     Filemark
-Block 8   Data   Second file's data
-Block 9   FM     Filemark
+Block 8   EOD    End-of-data marker (removed and rewritten on each append)
 …
-Block N   EOD    End-of-data marker
 ```
+
+Each file write appends `[Data, FM, EOD]`.  On the next write the EOD is
+removed (TruncateAt) before the new `[Data, FM, EOD]` is appended, so the
+final on-tape layout is `[Data₁, FM, Data₂, FM, …, Dataₙ, FM, EOD]`.
 
 For **file-backed images** this layout is split across two files:
 
@@ -309,12 +311,16 @@ uses Linux tape ioctls via `golang.org/x/sys/unix`:
 | `MTFSF n` | Space forward n filemarks (seeking past filemark blocks) |
 | `MTFSR n` | Space forward n data records (seeking past data blocks) |
 | `MTWEOF n` | Write n filemarks |
+| `MTEOM`  | Seek to logical end of medium (EOD) for reliable write positioning |
 | `MTOFFL` | Rewind and eject the tape cartridge |
 
 `SCSITape` maintains a `blockTypes []RecordType` slice (populated by a
 sequential scan on `OpenSCSI`) that records whether each block is a data
-record or a filemark.  This is used to choose the correct space command
-when seeking to an arbitrary block number.
+record, an ordinary filemark, or the EOD filemark (`RecordEOD`).  This is
+used to choose the correct space command when seeking to an arbitrary block
+number.  When writing, the tape head is positioned at the physical EOD via
+`MTEOM` (rather than rewinding and forward-spacing across the double-FM EOD
+marker, which would fail on real drives and MHVTL).
 
 A `SCSIRegionTape` wrapper provides the index (offset 0) and data (offset 6)
 views that the `TapeFS` layer expects.
@@ -461,9 +467,9 @@ Buffering an entire file in RAM and writing it at `close(2)` time means that
 the `close()` call can fail with EIO if the tape write fails, which confuses
 many tools (e.g. `cp` reports "failed to close").  By writing each FUSE Write
 request directly to tape, errors surface in `write()` rather than `close()`,
-which is the expected POSIX behavior.  The data partition is synced (fsync)
-before the index is updated on each write, ensuring the index never references
-data that has not reached durable storage.
+which is the expected POSIX behavior.  Each write appends a data block followed
+by a filemark and EOD marker directly to tape (no extra sync ioctl needed, as
+filemarks are written synchronously by the drive).
 
 **Why two partition files for the file backend?**  
 LTFS on LTO-5+ hardware uses SCSI medium partitions.  The two-file approach

@@ -20,6 +20,7 @@ const (
 	mtWEOF     = 5
 	mtREW      = 6
 	mtOFFL     = 7
+	mtEOM      = 12 // MTEOM: seek to end of recorded medium (logical EOD)
 	mtLOAD     = 30
 
 	maxSCSIRecordSize = 512 * 1024
@@ -154,7 +155,18 @@ func (t *SCSITape) WriteFilemark() (uint64, error) {
 func (t *SCSITape) WriteEOD() (uint64, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.writeFilemarkLocked()
+	n, err := t.writeFilemarkLocked()
+	if err != nil {
+		return 0, err
+	}
+	// Distinguish the EOD marker from ordinary inter-file filemarks in the
+	// in-memory block table so that AppendFileData can detect and remove it
+	// before writing the next file.  The physical write is the same (one
+	// MTWEOF), but the in-memory type is RecordEOD instead of RecordFilemark.
+	if len(t.blockTypes) > 0 {
+		t.blockTypes[len(t.blockTypes)-1] = RecordEOD
+	}
+	return n, nil
 }
 
 func (t *SCSITape) TruncateAt(blockNum uint64) error {
