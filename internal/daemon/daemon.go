@@ -135,6 +135,15 @@ func (d *Daemon) dispatch(req Request) Response {
 			return Response{OK: false, Error: "list takes no arguments"}
 		}
 		return d.cmdList()
+	case "defrag":
+		if len(req.Args) < 1 || len(req.Args) > 2 {
+			return Response{OK: false, Error: "defrag requires <letter> [size]"}
+		}
+		sizeStr := "10G"
+		if len(req.Args) == 2 {
+			sizeStr = req.Args[1]
+		}
+		return d.cmdDefrag(req.Args[0], sizeStr)
 	default:
 		return Response{OK: false, Error: "unknown command: " + req.Cmd}
 	}

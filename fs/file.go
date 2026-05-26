@@ -118,7 +118,7 @@ func (h *FileHandle) Release(_ context.Context, _ *fuse.ReleaseRequest) error {
 	if len(h.data) == 0 {
 		file.ExtentInfo.Extents = nil
 	} else {
-		extent, err := h.fs.tape.AppendFileData(h.data)
+		extent, err := h.fs.tape.WriteFileData(h.data, idx)
 		if err != nil {
 			return err
 		}

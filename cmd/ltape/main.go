@@ -92,6 +92,8 @@ Commands:
   umount <letter>             unmount tape filesystem
   eject <letter>              eject tape (assignment is kept; use swallow to reload)
   swallow <letter>            load previously ejected tape
-  list                        list assigned tapes and their status`)
+  list                        list assigned tapes and their status
+  defrag <letter> [size]      compact tape by removing deleted-file gaps
+                              (default size limit for staging area: 10G)`)
 	os.Exit(1)
 }

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
+	"strings"
 
 	"bazil.org/fuse"
 	bazilfs "bazil.org/fuse/fs"
@@ -290,4 +292,68 @@ func (d *Daemon) cmdList() Response {
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Letter < entries[j].Letter })
 	return Response{OK: true, Entries: entries}
+}
+
+func (d *Daemon) cmdDefrag(letter, sizeStr string) Response {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	e, ok := d.entries[letter]
+	if !ok {
+		return Response{OK: false, Error: fmt.Sprintf("letter %q not assigned", letter)}
+	}
+	if e.tapeFS == nil {
+		return Response{OK: false, Error: "tape not loaded; run load first"}
+	}
+	if e.mountPoint != "" {
+		return Response{OK: false, Error: "umount before defrag"}
+	}
+
+	sizeLimit, err := parseSize(sizeStr)
+	if err != nil {
+		return Response{OK: false, Error: "invalid size: " + err.Error()}
+	}
+
+	idx, err := ltfs.LoadIndexFromFile(IndexPath(letter))
+	if err != nil {
+		return Response{OK: false, Error: "load index: " + err.Error()}
+	}
+
+	stagingDir := "/tmp/ltape/defrag/" + letter
+	if err := e.tapeFS.Defrag(idx, stagingDir, sizeLimit); err != nil {
+		return Response{OK: false, Error: "defrag: " + err.Error()}
+	}
+
+	if err := ltfs.SaveIndexToFile(IndexPath(letter), idx); err != nil {
+		return Response{OK: false, Error: "save index: " + err.Error()}
+	}
+	d.logf("defrag completed for letter %s", letter)
+	return Response{OK: true}
+}
+
+// parseSize converts a human-readable size string (e.g. "10G", "512M", "1024K",
+// or a plain number of bytes) into a byte count.
+func parseSize(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty size string")
+	}
+	units := map[byte]int64{
+		'K': 1024,
+		'M': 1024 * 1024,
+		'G': 1024 * 1024 * 1024,
+		'T': 1024 * 1024 * 1024 * 1024,
+	}
+	last := s[len(s)-1]
+	if mult, ok := units[last]; ok {
+		n, err := strconv.ParseInt(s[:len(s)-1], 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("parse %q: %w", s, err)
+		}
+		return n * mult, nil
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse %q: %w", s, err)
+	}
+	return n, nil
 }

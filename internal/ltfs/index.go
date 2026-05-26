@@ -27,6 +27,9 @@ type Index struct {
 	AllowPolicyUpdate bool       `xml:"allowpolicyupdate"`
 	HighestFileUID    int64      `xml:"highestfileuid"`
 	Root              *Directory `xml:"directory"`
+	// AvailableSpaces lists deleted-file blocks that may be reused.
+	// This is a tapefuse-specific extension stored inside the LTFS index XML.
+	AvailableSpaces []AvailableSpace `xml:"availablespace"`
 }
 
 type Directory struct {
@@ -81,6 +84,17 @@ type Location struct {
 type XAttr struct {
 	Key   string `xml:"key"`
 	Value string `xml:"value"`
+}
+
+// AvailableSpace records a data-partition block whose file has been deleted and
+// whose physical storage can be reused for a new file of equal or smaller size.
+// This is a tapefuse-specific extension; standard LTFS clients ignore it.
+type AvailableSpace struct {
+	Partition  string `xml:"partition"`
+	StartBlock int64  `xml:"startblock"`
+	// ByteCount is the physical data capacity of the block (the original
+	// file's byte length when it was first written to this block).
+	ByteCount int64 `xml:"bytecount"`
 }
 
 func Now() string {
@@ -273,6 +287,20 @@ func TouchFile(file *File, ts string) {
 	file.ChangeTime = ts
 	file.ModifyTime = ts
 	file.AccessTime = ts
+}
+
+// AllFiles returns pointers to all File entries reachable from dir.
+// The pointers remain valid as long as no elements are added to or removed
+// from any directory's Contents.Files slice in the tree.
+func AllFiles(dir *Directory) []*File {
+	var out []*File
+	for i := range dir.Contents.Files {
+		out = append(out, &dir.Contents.Files[i])
+	}
+	for i := range dir.Contents.Directories {
+		out = append(out, AllFiles(&dir.Contents.Directories[i])...)
+	}
+	return out
 }
 
 // LoadIndexFromFile reads an LTFS index from a disk cache file.

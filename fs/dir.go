@@ -188,6 +188,24 @@ func (d *Dir) Remove(_ context.Context, req *fuse.RemoveRequest) error {
 		if child.Name != req.Name {
 			continue
 		}
+		// Record the deleted file's extents as available spaces so they can
+		// be reused by future writes (sparse appending strategy).
+		for _, ext := range child.ExtentInfo.Extents {
+			if ext.ByteCount <= 0 {
+				continue
+			}
+			// Prefer the physical block capacity so that re-reused slots
+			// accurately report their true capacity.
+			physCap := d.fs.tape.DataBlockCapacity(uint64(ext.StartBlock))
+			if physCap <= 0 {
+				physCap = ext.ByteCount
+			}
+			idx.AvailableSpaces = append(idx.AvailableSpaces, ltfs.AvailableSpace{
+				Partition:  ext.Partition,
+				StartBlock: ext.StartBlock,
+				ByteCount:  physCap,
+			})
+		}
 		dir.Contents.Files = append(dir.Contents.Files[:i], dir.Contents.Files[i+1:]...)
 		ltfs.TouchDirectory(dir, now)
 		return d.fs.saveIndex(idx)

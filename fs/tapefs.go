@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/google/uuid"
@@ -394,6 +395,239 @@ func (t *TapeFS) AppendFileData(data []byte) (ltfs.Extent, error) {
 		ByteOffset: 0,
 		ByteCount:  int64(len(data)),
 	}, nil
+}
+
+// DataBlockCapacity returns the physical byte capacity of the data block at
+// blockNum. Returns -1 if the underlying backend does not support in-place
+// block inspection (e.g. SCSI tape).
+func (t *TapeFS) DataBlockCapacity(blockNum uint64) int64 {
+	part, ok := t.DataPartition.(*tape.Partition)
+	if !ok {
+		return -1
+	}
+	n, err := part.BlockDataLen(blockNum)
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+// WriteFileData writes data to the tape, preferring to reuse a previously
+// freed block (sparse appending) before falling back to appending at the tail.
+//
+// Best-fit selection: among available spaces whose ByteCount >= len(data),
+// the one with the smallest ByteCount is chosen.
+//
+// File-backed tape: any available space may be reused by overwriting the block
+// in-place (safe because the file is random-access).
+//
+// SCSI tape: reuse is only safe when no live data physically follows the
+// candidate block (seeking backward overwrites everything after the head).
+// For each candidate space, the index is scanned for the highest live-file
+// StartBlock; the space is eligible only if its StartBlock exceeds that value.
+// On a match the tape head is rewound to the space's block via TruncateAt and
+// the file is written from there with AppendFileData.
+//
+// On reuse the selected entry is removed from idx.AvailableSpaces.
+func (t *TapeFS) WriteFileData(data []byte, idx *ltfs.Index) (ltfs.Extent, error) {
+	if len(idx.AvailableSpaces) == 0 {
+		return t.AppendFileData(data)
+	}
+
+	if part, ok := t.DataPartition.(*tape.Partition); ok {
+		// File-backed tape: any space may be overwritten in-place.
+		best := -1
+		for i, sp := range idx.AvailableSpaces {
+			if sp.Partition != "b" || sp.ByteCount < int64(len(data)) {
+				continue
+			}
+			if best < 0 || idx.AvailableSpaces[best].ByteCount > sp.ByteCount {
+				best = i
+			}
+		}
+		if best >= 0 {
+			sp := idx.AvailableSpaces[best]
+			if err := part.OverwriteBlock(uint64(sp.StartBlock), data); err != nil {
+				return ltfs.Extent{}, err
+			}
+			idx.AvailableSpaces = append(
+				idx.AvailableSpaces[:best],
+				idx.AvailableSpaces[best+1:]...,
+			)
+			return ltfs.Extent{
+				FileOffset: 0,
+				Partition:  "b",
+				StartBlock: sp.StartBlock,
+				ByteOffset: 0,
+				ByteCount:  int64(len(data)),
+			}, nil
+		}
+	} else {
+		// SCSI tape: only safe to reuse a space when nothing live comes after
+		// it on the physical tape.  Compute the highest StartBlock currently
+		// referenced by any live file.
+		var maxLiveBlock int64 = -1
+		for _, f := range ltfs.AllFiles(idx.Root) {
+			for _, ext := range f.ExtentInfo.Extents {
+				if ext.StartBlock > maxLiveBlock {
+					maxLiveBlock = ext.StartBlock
+				}
+			}
+		}
+
+		best := -1
+		for i, sp := range idx.AvailableSpaces {
+			if sp.Partition != "b" || sp.ByteCount < int64(len(data)) {
+				continue
+			}
+			// Skip spaces that have live data physically after them.
+			if sp.StartBlock <= maxLiveBlock {
+				continue
+			}
+			if best < 0 || idx.AvailableSpaces[best].ByteCount > sp.ByteCount {
+				best = i
+			}
+		}
+		if best >= 0 {
+			sp := idx.AvailableSpaces[best]
+			// Remove the entry before writing so the index stays consistent
+			// even if the write fails after TruncateAt.
+			idx.AvailableSpaces = append(
+				idx.AvailableSpaces[:best],
+				idx.AvailableSpaces[best+1:]...,
+			)
+			// Rewind to the freed block; AppendFileData then writes from here.
+			if err := t.DataPartition.TruncateAt(uint64(sp.StartBlock)); err != nil {
+				return ltfs.Extent{}, fmt.Errorf("seek to available space: %w", err)
+			}
+			return t.AppendFileData(data)
+		}
+	}
+
+	return t.AppendFileData(data)
+}
+
+// Defrag compacts the data partition by removing gaps left by deleted files.
+//
+// Algorithm:
+//  1. Locate holeStart = minimum StartBlock across all available spaces.
+//  2. Collect every live file whose extents lie at or after holeStart; those
+//     blocks will be destroyed by the truncation in step 4.
+//  3. If total staged bytes > sizeLimit, return an error.
+//  4. Read each to-be-moved file's data and write it to stagingDir/<FileUID>.
+//  5. Truncate the data partition at holeStart (erasing holes + following data).
+//  6. Rewrite each staged file sequentially via AppendFileData and update its
+//     extent in idx.
+//  7. Clear idx.AvailableSpaces.
+//
+// The staging directory is removed on success.
+func (t *TapeFS) Defrag(idx *ltfs.Index, stagingDir string, sizeLimit int64) error {
+	if len(idx.AvailableSpaces) == 0 {
+		return nil
+	}
+
+	// 1. Find the first hole.
+	holeStart := idx.AvailableSpaces[0].StartBlock
+	for _, sp := range idx.AvailableSpaces[1:] {
+		if sp.StartBlock < holeStart {
+			holeStart = sp.StartBlock
+		}
+	}
+
+	// 2. Collect live files that need to be moved.
+	type entry struct {
+		file    *ltfs.File
+		origMin int64 // minimum StartBlock across all extents (for ordering)
+	}
+	var toMove []entry
+	var totalBytes int64
+	for _, f := range ltfs.AllFiles(idx.Root) {
+		needsMove := false
+		var minBlock int64 = -1
+		for _, ext := range f.ExtentInfo.Extents {
+			if ext.StartBlock >= holeStart {
+				needsMove = true
+			}
+			if minBlock < 0 || ext.StartBlock < minBlock {
+				minBlock = ext.StartBlock
+			}
+		}
+		if needsMove {
+			totalBytes += f.Length
+			toMove = append(toMove, entry{file: f, origMin: minBlock})
+		}
+	}
+
+	// 3. Check staging size limit.
+	if sizeLimit > 0 && totalBytes > sizeLimit {
+		return fmt.Errorf(
+			"live data after first hole (%d bytes) exceeds staging limit (%d bytes); "+
+				"increase the size limit or free more space",
+			totalBytes, sizeLimit,
+		)
+	}
+
+	if len(toMove) == 0 {
+		// All holes are at or past the last live file; just truncate.
+		if err := t.DataPartition.TruncateAt(uint64(holeStart)); err != nil {
+			return fmt.Errorf("truncate data partition: %w", err)
+		}
+		idx.AvailableSpaces = nil
+		return t.DataPartition.Sync()
+	}
+
+	// Sort by original tape position so relative order is preserved.
+	sort.Slice(toMove, func(i, j int) bool {
+		return toMove[i].origMin < toMove[j].origMin
+	})
+
+	// 4. Stage files to disk.
+	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
+		return fmt.Errorf("create staging dir: %w", err)
+	}
+
+	type stageFile struct {
+		file *ltfs.File
+		path string
+	}
+	staged := make([]stageFile, 0, len(toMove))
+	for _, e := range toMove {
+		data, err := t.ReadFileData(e.file)
+		if err != nil {
+			_ = os.RemoveAll(stagingDir)
+			return fmt.Errorf("read %q for staging: %w", e.file.Name, err)
+		}
+		p := filepath.Join(stagingDir, fmt.Sprintf("%d", e.file.FileUID))
+		if err := os.WriteFile(p, data, 0o600); err != nil {
+			_ = os.RemoveAll(stagingDir)
+			return fmt.Errorf("write staging file: %w", err)
+		}
+		staged = append(staged, stageFile{file: e.file, path: p})
+	}
+
+	// 5. Truncate at the first hole.
+	if err := t.DataPartition.TruncateAt(uint64(holeStart)); err != nil {
+		_ = os.RemoveAll(stagingDir)
+		return fmt.Errorf("truncate data partition: %w", err)
+	}
+
+	// 6. Rewrite staged files and update extents.
+	for _, sf := range staged {
+		data, err := os.ReadFile(sf.path)
+		if err != nil {
+			return fmt.Errorf("read staged file for %q: %w", sf.file.Name, err)
+		}
+		extent, err := t.AppendFileData(data)
+		if err != nil {
+			return fmt.Errorf("rewrite %q: %w", sf.file.Name, err)
+		}
+		sf.file.ExtentInfo.Extents = []ltfs.Extent{extent}
+	}
+
+	// 7. Clear available spaces and clean up staging area.
+	idx.AvailableSpaces = nil
+	_ = os.RemoveAll(stagingDir)
+	return t.DataPartition.Sync()
 }
 
 func (t *TapeFS) partitionFor(partition string) tape.Tape {

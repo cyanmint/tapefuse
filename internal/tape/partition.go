@@ -195,6 +195,59 @@ func (p *Partition) LastRecordType() (RecordType, bool, error) {
 	return RecordType(binary.LittleEndian.Uint32(hdr[0:4])), true, nil
 }
 
+// BlockDataLen returns the data byte length stored in the header of the given block.
+// This is the physical capacity of that block's data region.
+func (p *Partition) BlockDataLen(blockNum uint64) (int64, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if blockNum >= p.nextBlock {
+		return 0, fmt.Errorf("block %d out of range", blockNum)
+	}
+	hdr := make([]byte, 8)
+	if _, err := p.f.ReadAt(hdr, p.blockIndex[blockNum]); err != nil {
+		return 0, err
+	}
+	return int64(binary.LittleEndian.Uint32(hdr[4:8])), nil
+}
+
+// OverwriteBlock rewrites the data bytes of an existing block in-place.
+// The new data must be no longer than the block's original data capacity
+// (as returned by BlockDataLen). Any remaining bytes in the block are
+// zeroed so that the block retains its original physical size, keeping
+// all subsequent block offsets valid.
+func (p *Partition) OverwriteBlock(blockNum uint64, data []byte) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if blockNum >= p.nextBlock {
+		return fmt.Errorf("block %d out of range", blockNum)
+	}
+	offset := p.blockIndex[blockNum]
+	hdr := make([]byte, 8)
+	if _, err := p.f.ReadAt(hdr, offset); err != nil {
+		return err
+	}
+	physLen := int64(binary.LittleEndian.Uint32(hdr[4:8]))
+	if int64(len(data)) > physLen {
+		return fmt.Errorf("data length %d exceeds block capacity %d", len(data), physLen)
+	}
+	// Overwrite the data region (header stays unchanged).
+	if len(data) > 0 {
+		if _, err := p.f.WriteAt(data, offset+8); err != nil {
+			return err
+		}
+	}
+	// Zero-pad the remainder to preserve the physical block size.
+	if rem := physLen - int64(len(data)); rem > 0 {
+		zeros := make([]byte, rem)
+		if _, err := p.f.WriteAt(zeros, offset+8+int64(len(data))); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (p *Partition) Sync() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
