@@ -83,7 +83,6 @@ go mod tidy
 go build ./...
 
 # Fully static binaries (recommended for deployment)
-CGO_ENABLED=0 go build -ldflags '-extldflags "-static"' -o ltaped ./cmd/ltaped
 CGO_ENABLED=0 go build -ldflags '-extldflags "-static"' -o ltape  ./cmd/ltape
 ```
 
