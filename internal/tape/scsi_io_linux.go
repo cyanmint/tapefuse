@@ -8,6 +8,7 @@ import (
 	"log"
 	"path/filepath"
 	"strings"
+	"time"
 	"unsafe"
 
 	"github.com/google/uuid"
@@ -116,8 +117,29 @@ func (t *SCSITape) writeRecordLocked(rec Record) (uint64, error) {
 		}
 	}
 	log.Printf("tape %s: write: data record at block %d (%d bytes)", t.device, t.writePos, len(rec.Data))
-	n, err := unix.Write(t.fd, rec.Data)
-	if err != nil {
+	delay := busyRetryInit
+	var n int
+	var err error
+	for attempt := 0; ; attempt++ {
+		n, err = unix.Write(t.fd, rec.Data)
+		if err == nil {
+			break
+		}
+		if errors.Is(err, unix.EBUSY) && attempt < maxBusyRetries {
+			log.Printf("tape %s: write EBUSY at block %d (attempt %d/%d), retrying in %v",
+				t.device, t.writePos, attempt+1, maxBusyRetries, delay)
+			t.tapPos = unknownTapePos
+			time.Sleep(delay)
+			delay *= 2
+			if delay > busyRetryMaxWait {
+				delay = busyRetryMaxWait
+			}
+			// Re-seek to the write position before retrying.
+			if err2 := t.positionToLocked(t.writePos); err2 != nil {
+				return 0, err2
+			}
+			continue
+		}
 		t.tapPos = unknownTapePos
 		return 0, err
 	}
@@ -221,11 +243,23 @@ func (t *SCSITape) readOneLocked() (*Record, error) {
 
 func ioctlMtop(fd int, op int16, count int32) error {
 	mt := mtop{Op: op, Count: count}
-	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(mtIoctlTop), uintptr(unsafe.Pointer(&mt)))
-	if errno != 0 {
+	delay := busyRetryInit
+	for attempt := 0; ; attempt++ {
+		_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(mtIoctlTop), uintptr(unsafe.Pointer(&mt)))
+		if errno == 0 {
+			return nil
+		}
+		if errors.Is(errno, unix.EBUSY) && attempt < maxBusyRetries {
+			log.Printf("tape: ioctl op=%d EBUSY (attempt %d/%d), retrying in %v", op, attempt+1, maxBusyRetries, delay)
+			time.Sleep(delay)
+			delay *= 2
+			if delay > busyRetryMaxWait {
+				delay = busyRetryMaxWait
+			}
+			continue
+		}
 		return errno
 	}
-	return nil
 }
 
 func makeVOL1Label(device string) []byte {

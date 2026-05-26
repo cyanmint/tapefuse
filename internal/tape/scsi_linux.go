@@ -9,8 +9,21 @@ import (
 	"log"
 	"os"
 	"sync"
+	"time"
 
 	"golang.org/x/sys/unix"
+)
+
+// busyRetry* controls how many times and how long a tape ioctl or write is
+// retried when the SCSI drive returns EBUSY.  A real LTO drive can return
+// EBUSY for a fraction of a second while its hardware write-buffer is
+// still committing the previous large data block to tape media.  Retrying
+// with an exponential backoff resolves the condition without any error
+// visible to callers.
+const (
+	maxBusyRetries   = 10
+	busyRetryInit    = 50 * time.Millisecond
+	busyRetryMaxWait = 500 * time.Millisecond
 )
 
 const (
