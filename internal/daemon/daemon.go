@@ -79,7 +79,11 @@ func (d *Daemon) handleConn(conn net.Conn) {
 }
 
 func (d *Daemon) dispatch(req Request) Response {
-	switch req.Cmd {
+	cmd, err := ResolveCmd(req.Cmd, KnownCmds)
+	if err != nil {
+		return Response{OK: false, Error: err.Error()}
+	}
+	switch cmd {
 	case "assign":
 		if len(req.Args) != 2 {
 			return Response{OK: false, Error: "assign requires <device> <letter>"}
@@ -144,9 +148,9 @@ func (d *Daemon) dispatch(req Request) Response {
 			sizeStr = req.Args[1]
 		}
 		return d.cmdDefrag(req.Args[0], sizeStr)
-	default:
-		return Response{OK: false, Error: "unknown command: " + req.Cmd}
 	}
+	// Unreachable: ResolveCmd guarantees cmd is a known command.
+	return Response{OK: false, Error: "unknown command: " + cmd}
 }
 
 func (d *Daemon) closeEntry(e *entry) {

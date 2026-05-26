@@ -22,19 +22,33 @@ filesystem backed by a real or emulated LTO tape drive using the
 - **FUSE filesystem** — once a tape is loaded and mounted, the contents appear
   as a normal directory; create, read, rename and delete operations are fully
   supported
+- **Realtime file I/O** — file data is written to tape immediately on each
+  `write(2)` call (no in-memory write buffer); reads go directly to tape as
+  well.  Two write strategies keep tape use efficient:
+  - *Append* — writes at or beyond the current file end (including all writes
+    to new and truncated files) append a new tape block and add a new extent.
+  - *In-place edit* — writes within an existing file's content read the full
+    current file from tape, apply the patch, free the old block as reusable
+    space, and write a single merged block back (reusing the freed slot where
+    possible).
 - **Disk-cached index** — the LTFS index XML is never held only in RAM; it is
   read from and written to `/tmp/ltape/index/<letter>.index` on every metadata
   operation, so the cache is always consistent and survives daemon crashes
-- **Explicit commit** — file data is written to tape immediately on `close(2)`,
-  but the index must be committed separately; this mirrors how real tape drives
-  work and protects against index corruption
+- **Explicit commit** — the LTFS index must be committed separately with
+  `ltape commit` (or by writing to `/.tapefuse_flush`); this mirrors how real
+  tape drives work and prevents index bloat
+- **Sparse space reuse** — deleted-file blocks are recorded as available space
+  in the index and reused on subsequent writes (best-fit selection)
+- **Defrag** — `ltape defrag` compacts the data partition by staging live files
+  to disk, truncating at the first gap, and rewriting them sequentially
 - **Physical eject** — `ltape eject` unmounts the FUSE filesystem, waits for
   the FUSE goroutine to exit, and issues the SCSI `MTOFFL` command to
   physically retract the tape before removing the assignment
+- **Prefix abbreviation** — all `ltape` commands support unambiguous prefix
+  matching: `ltape mo a /mnt` resolves to `mount`; an ambiguous prefix like
+  `d` prints `ambiguous: "d" matches daemon, defrag, discard`
 - **Verbose operation logs** — `ltaped` logs daemon lifecycle and command
   handling; `ltape` prints request/response progress to stderr
-- **Static binaries** — the CI workflow produces fully statically linked
-  `ltaped` and `ltape` with `CGO_ENABLED=0`
 
 ---
 
@@ -74,7 +88,7 @@ CGO_ENABLED=0 go build -ldflags '-extldflags "-static"' -o ltape  ./cmd/ltape
 
 ```bash
 # 1. Start the daemon (in the background or a separate terminal)
-./ltaped &
+./ltape daemon on          # or: ./ltaped &
 
 # 2. Assign a device path to a short letter.
 #    For file-backed mode, use any non-existent path prefix.
@@ -91,7 +105,7 @@ CGO_ENABLED=0 go build -ldflags '-extldflags "-static"' -o ltape  ./cmd/ltape
 mkdir -p /mnt/tape
 ./ltape mount a /mnt/tape
 
-# 6. Use it like any directory
+# 6. Use it like any directory — writes go to tape immediately
 cp myfile.txt /mnt/tape/
 ls /mnt/tape/
 
@@ -127,7 +141,10 @@ cp bigfile.iso /mnt/tape/
 ## Command Reference
 
 All commands are sent to `ltaped` via the Unix socket at
-`/tmp/ltape/ltaped.sock`.
+`/tmp/ltape/ltaped.sock`.  Commands support **unambiguous prefix
+abbreviation**: type enough letters to uniquely identify a command.
+An ambiguous prefix prints all matches; e.g. `ltape d` prints
+`ambiguous: "d" matches daemon, defrag, discard`.
 
 ```
 ltape <command> [args]
@@ -255,10 +272,10 @@ tapefuse intentionally avoids keeping the index in RAM:
    generation number.  The updated index is also written back to disk.
 4. `discard` simply deletes the disk cache file.
 
-File **data** never passes through the index cache.  On `close(2)` the
-`FileHandle.Release` FUSE callback calls `TapeFS.AppendFileData` directly,
-which appends the data block to the tape's data partition and records the
-resulting extent in the disk-cached index.
+File **data** never passes through the index cache.  On each `write(2)` the
+`FileHandle.Write` FUSE callback calls `TapeFS.WriteChunkToFile` directly,
+which either appends a new block to the data partition or rewrites the file
+in-place, then records the resulting extent(s) in the disk-cached index.
 
 ---
 
@@ -436,8 +453,17 @@ single atomic file operation per metadata call.
 
 **Why explicit commit?**  
 Tape drives are write-once sequential media.  Appending a new index on every
-file close would rapidly consume the tape.  Batching index writes (commit)
+file write would rapidly consume the tape.  Batching index writes (commit)
 matches how both LTFS reference implementations and real tape software behave.
+
+**Why realtime file writes (no write buffer)?**  
+Buffering an entire file in RAM and writing it at `close(2)` time means that
+the `close()` call can fail with EIO if the tape write fails, which confuses
+many tools (e.g. `cp` reports "failed to close").  By writing each FUSE Write
+request directly to tape, errors surface in `write()` rather than `close()`,
+which is the expected POSIX behavior.  The data partition is synced (fsync)
+before the index is updated on each write, ensuring the index never references
+data that has not reached durable storage.
 
 **Why two partition files for the file backend?**  
 LTFS on LTO-5+ hardware uses SCSI medium partitions.  The two-file approach
@@ -446,8 +472,8 @@ always addresses the "index partition" and "data partition" independently.
 
 **Why no in-memory index in the FUSE layer?**  
 Caching the parsed index in the FUSE layer would create a coherency problem:
-`commit` reads the disk cache, and `FileHandle.Release` writes to it.  If the
-FUSE layer held a separate in-memory copy, a crash between a Release and a
+`commit` reads the disk cache, and `FileHandle.Write` writes to it.  If the
+FUSE layer held a separate in-memory copy, a crash between a Write and a
 Commit could produce an index that referred to data blocks that were never
 actually written.  The disk-IO cost per metadata operation is negligible
 compared to tape seek latency.

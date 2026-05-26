@@ -36,10 +36,8 @@ type File struct {
 }
 
 type FileHandle struct {
-	fs    *FS
-	path  string
-	data  []byte
-	dirty bool
+	fs   *FS
+	path string
 }
 
 type FlushFile struct {

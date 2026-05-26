@@ -384,9 +384,6 @@ func (t *TapeFS) AppendFileData(data []byte) (ltfs.Extent, error) {
 	if _, err := t.DataPartition.WriteEOD(); err != nil {
 		return ltfs.Extent{}, err
 	}
-	if err := t.DataPartition.Sync(); err != nil {
-		return ltfs.Extent{}, err
-	}
 
 	return ltfs.Extent{
 		FileOffset: 0,
@@ -395,6 +392,72 @@ func (t *TapeFS) AppendFileData(data []byte) (ltfs.Extent, error) {
 		ByteOffset: 0,
 		ByteCount:  int64(len(data)),
 	}, nil
+}
+
+// WriteChunkToFile writes a single data chunk to tape at the given byte
+// offset within file.  Two strategies are applied:
+//
+//   - Append (offset >= file.Length, or file has no extents): the chunk is
+//     written via AppendFileData and a new extent is appended to the file.
+//     This handles all writes to new or truncated files (e.g. cp copies).
+//
+//   - In-place edit (offset < file.Length): the full current content is read
+//     from tape, the patch is applied, all existing extents are freed into
+//     idx.AvailableSpaces, and the merged content is written as a single new
+//     block via WriteFileData (which may reuse a freed slot).
+//
+// The caller is responsible for updating file.Length and saving the index
+// after this call returns.
+func (t *TapeFS) WriteChunkToFile(file *ltfs.File, offset int64, data []byte, idx *ltfs.Index) error {
+	// Append: new file creation or sequential growth beyond current EOF.
+	if offset >= file.Length || len(file.ExtentInfo.Extents) == 0 {
+		extent, err := t.AppendFileData(data)
+		if err != nil {
+			return err
+		}
+		extent.FileOffset = offset
+		file.ExtentInfo.Extents = append(file.ExtentInfo.Extents, extent)
+		return nil
+	}
+
+	// In-place edit: read full file content, patch, rewrite as single block.
+	existing, err := t.ReadFileData(file)
+	if err != nil {
+		return err
+	}
+
+	endOffset := offset + int64(len(data))
+	if endOffset > int64(len(existing)) {
+		grown := make([]byte, endOffset)
+		copy(grown, existing)
+		existing = grown
+	}
+	copy(existing[offset:endOffset], data)
+
+	// Free all existing extents before writing the merged block so that
+	// WriteFileData can reuse one of the freed slots (best-fit).
+	for _, ext := range file.ExtentInfo.Extents {
+		if ext.Partition == "b" && ext.ByteCount > 0 {
+			physCap := t.DataBlockCapacity(uint64(ext.StartBlock))
+			if physCap <= 0 {
+				physCap = ext.ByteCount
+			}
+			idx.AvailableSpaces = append(idx.AvailableSpaces, ltfs.AvailableSpace{
+				Partition:  ext.Partition,
+				StartBlock: ext.StartBlock,
+				ByteCount:  physCap,
+			})
+		}
+	}
+	file.ExtentInfo.Extents = nil
+
+	newExtent, err := t.WriteFileData(existing, idx)
+	if err != nil {
+		return err
+	}
+	newExtent.FileOffset = 0
+	file.ExtentInfo.Extents = []ltfs.Extent{newExtent}
+	return nil
 }
 
 // DataBlockCapacity returns the physical byte capacity of the data block at

@@ -118,7 +118,7 @@ func (d *Dir) Create(_ context.Context, req *fuse.CreateRequest, _ *fuse.CreateR
 	}
 
 	childPath := joinPath(d.path, req.Name)
-	handle := &FileHandle{fs: d.fs, path: childPath, data: []byte{}}
+	handle := &FileHandle{fs: d.fs, path: childPath}
 	return &File{fs: d.fs, path: childPath}, handle, nil
 }
 

@@ -35,6 +35,16 @@ func main() {
 	cmd := os.Args[1]
 	args := os.Args[2:]
 
+	// Resolve the top-level command via unambiguous prefix matching.
+	// "daemon" is handled locally; all other commands are forwarded to ltaped.
+	allCmds := append([]string{"daemon"}, daemon.KnownCmds...)
+	resolvedCmd, err := daemon.ResolveCmd(cmd, allCmds)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	cmd = resolvedCmd
+
 	// Handle daemon lifecycle commands locally — they do not talk to the
 	// running daemon process.
 	if cmd == "daemon" {
@@ -42,14 +52,16 @@ func main() {
 			fmt.Fprintln(os.Stderr, "usage: ltape daemon <on|off>")
 			os.Exit(1)
 		}
-		switch args[0] {
+		sub, err := daemon.ResolveCmd(args[0], []string{"on", "off"})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "daemon: %s\n", err)
+			os.Exit(1)
+		}
+		switch sub {
 		case "on":
 			daemonOn()
 		case "off":
 			daemonOff()
-		default:
-			fmt.Fprintf(os.Stderr, "unknown daemon subcommand %q; use 'on' or 'off'\n", args[0])
-			os.Exit(1)
 		}
 		return
 	}

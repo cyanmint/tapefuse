@@ -1,198 +1,226 @@
 package fs
 
 import (
-	"context"
-	"syscall"
+"context"
+"syscall"
 
-	"bazil.org/fuse"
-	bazilfs "bazil.org/fuse/fs"
+"bazil.org/fuse"
+bazilfs "bazil.org/fuse/fs"
 
-	"github.com/cyanmint/tapefuse/internal/ltfs"
+"github.com/cyanmint/tapefuse/internal/ltfs"
 )
 
 func (f *File) Attr(_ context.Context, a *fuse.Attr) error {
-	f.fs.mu.RLock()
-	defer f.fs.mu.RUnlock()
+f.fs.mu.RLock()
+defer f.fs.mu.RUnlock()
 
-	idx, err := f.fs.loadIndex()
-	if err != nil {
-		return fuse.EIO
-	}
-	file, _, err := idx.FindFile(f.path)
-	if err != nil {
-		return fuse.ENOENT
-	}
-	a.Mode = 0o644
-	a.Size = uint64(file.Length)
-	a.Mtime = ltfs.ParseTime(file.ModifyTime)
-	a.Ctime = ltfs.ParseTime(file.ChangeTime)
-	a.Atime = ltfs.ParseTime(file.AccessTime)
-	return nil
+idx, err := f.fs.loadIndex()
+if err != nil {
+return fuse.EIO
+}
+file, _, err := idx.FindFile(f.path)
+if err != nil {
+return fuse.ENOENT
+}
+a.Mode = 0o644
+a.Size = uint64(file.Length)
+a.Mtime = ltfs.ParseTime(file.ModifyTime)
+a.Ctime = ltfs.ParseTime(file.ChangeTime)
+a.Atime = ltfs.ParseTime(file.AccessTime)
+return nil
 }
 
+// Open returns a FileHandle for the file.  For a truncating open (O_TRUNC)
+// all existing extents are freed (marked as available space) and the file
+// length is reset to zero so subsequent writes start from a clean slate.
 func (f *File) Open(_ context.Context, req *fuse.OpenRequest, _ *fuse.OpenResponse) (bazilfs.Handle, error) {
-	f.fs.mu.RLock()
-	defer f.fs.mu.RUnlock()
+if req.Flags&fuse.OpenTruncate == 0 {
+// Non-truncating open: just verify the file exists.
+f.fs.mu.RLock()
+defer f.fs.mu.RUnlock()
+idx, err := f.fs.loadIndex()
+if err != nil {
+return nil, fuse.EIO
+}
+if _, _, err := idx.FindFile(f.path); err != nil {
+return nil, fuse.ENOENT
+}
+return &FileHandle{fs: f.fs, path: f.path}, nil
+}
 
-	idx, err := f.fs.loadIndex()
-	if err != nil {
-		return nil, fuse.EIO
-	}
-	file, _, err := idx.FindFile(f.path)
-	if err != nil {
-		return nil, fuse.ENOENT
-	}
-	data, err := f.fs.tape.ReadFileData(file)
-	if err != nil {
-		return nil, err
-	}
-	handle := &FileHandle{fs: f.fs, path: f.path, data: data}
-	if req.Flags&fuse.OpenTruncate != 0 {
-		handle.data = []byte{}
-		handle.dirty = true
-	}
-	return handle, nil
+// Truncating open: free existing extents and reset the file length.
+f.fs.mu.Lock()
+defer f.fs.mu.Unlock()
+idx, err := f.fs.loadIndex()
+if err != nil {
+return nil, fuse.EIO
+}
+file, _, err := idx.FindFile(f.path)
+if err != nil {
+return nil, fuse.ENOENT
+}
+for _, ext := range file.ExtentInfo.Extents {
+if ext.Partition == "b" && ext.ByteCount > 0 {
+physCap := f.fs.tape.DataBlockCapacity(uint64(ext.StartBlock))
+if physCap <= 0 {
+physCap = ext.ByteCount
+}
+idx.AvailableSpaces = append(idx.AvailableSpaces, ltfs.AvailableSpace{
+Partition:  ext.Partition,
+StartBlock: ext.StartBlock,
+ByteCount:  physCap,
+})
+}
+}
+file.ExtentInfo.Extents = nil
+file.Length = 0
+if err := f.fs.saveIndex(idx); err != nil {
+return nil, fuse.EIO
+}
+return &FileHandle{fs: f.fs, path: f.path}, nil
 }
 
 func (f *File) Fsync(_ context.Context, _ *fuse.FsyncRequest) error {
-	return nil
+return nil
 }
 
+// Read reads file data directly from tape using the file's extent list.
+// No in-memory file cache is kept; every read hits the tape (or its OS
+// page-cache equivalent for file-backed partitions).
 func (h *FileHandle) Read(_ context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
-	if req.Offset < 0 {
-		return fuse.Errno(syscall.EINVAL)
-	}
-	if req.Offset >= int64(len(h.data)) {
-		resp.Data = []byte{}
-		return nil
-	}
-	start := int(req.Offset)
-	end := start + req.Size
-	if end > len(h.data) {
-		end = len(h.data)
-	}
-	resp.Data = append([]byte(nil), h.data[start:end]...)
-	return nil
+if req.Offset < 0 {
+return fuse.Errno(syscall.EINVAL)
+}
+h.fs.mu.RLock()
+defer h.fs.mu.RUnlock()
+
+idx, err := h.fs.loadIndex()
+if err != nil {
+return fuse.EIO
+}
+file, _, err := idx.FindFile(h.path)
+if err != nil {
+return fuse.ENOENT
+}
+data, err := h.fs.tape.ReadFileRange(file, req.Offset, req.Size)
+if err != nil {
+return fuse.EIO
+}
+resp.Data = data
+return nil
 }
 
+// Write writes data directly to tape.  There is no in-memory write buffer:
+// each FUSE Write request produces an immediate tape write.
+//
+// Two strategies are used depending on the write offset:
+//
+//   - Append (offset >= file.Length, or file has no extents): the chunk is
+//     appended at the end of the data partition via AppendFileData and a new
+//     extent is added to the file.  This covers all writes to newly-created
+//     and truncated files, including sequential cp(1) copies.
+//
+//   - In-place edit (offset < file.Length): the entire current file content is
+//     read from tape, the chunk is patched in at the requested offset, all old
+//     extents are freed as available space, and the merged content is written
+//     back as a single new block via WriteFileData (which may reuse a freed
+//     block).
+//
+// After writing, the data partition is synced before the index is saved so
+// that a daemon crash cannot produce an index that references un-persisted data.
 func (h *FileHandle) Write(_ context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
-	if req.Offset < 0 {
-		return fuse.Errno(syscall.EINVAL)
-	}
-	start := int(req.Offset)
-	end := start + len(req.Data)
-	if end < 0 {
-		return fuse.Errno(syscall.EINVAL)
-	}
-	if end > len(h.data) {
-		grown := make([]byte, end)
-		copy(grown, h.data)
-		h.data = grown
-	}
-	copy(h.data[start:end], req.Data)
-	h.dirty = true
-	resp.Size = len(req.Data)
-	return nil
+if req.Offset < 0 {
+return fuse.Errno(syscall.EINVAL)
+}
+if len(req.Data) == 0 {
+resp.Size = 0
+return nil
+}
+
+h.fs.mu.Lock()
+defer h.fs.mu.Unlock()
+
+idx, err := h.fs.loadIndex()
+if err != nil {
+return fuse.EIO
+}
+file, parent, err := idx.FindFile(h.path)
+if err != nil {
+return fuse.ENOENT
+}
+
+if err := h.fs.tape.WriteChunkToFile(file, req.Offset, req.Data, idx); err != nil {
+return err
+}
+
+// Sync data to durable storage BEFORE saving the index so that a crash
+// cannot leave the index referencing data blocks that were not persisted.
+if err := h.fs.tape.DataPartition.Sync(); err != nil {
+return err
+}
+
+newEnd := req.Offset + int64(len(req.Data))
+if newEnd > file.Length {
+file.Length = newEnd
+}
+now := ltfs.Now()
+ltfs.TouchFile(file, now)
+ltfs.TouchDirectory(parent, now)
+if err := h.fs.saveIndex(idx); err != nil {
+return fuse.EIO
+}
+resp.Size = len(req.Data)
+return nil
+}
+
+// Flush is called by FUSE when the file descriptor is closed.  Because all
+// writes are committed to tape and the index is persisted inside Write(),
+// there is nothing left to do here.
+func (h *FileHandle) Flush(_ context.Context, _ *fuse.FlushRequest) error {
+return nil
 }
 
 func (h *FileHandle) Release(_ context.Context, _ *fuse.ReleaseRequest) error {
-	if !h.dirty {
-		return nil
-	}
-	// Flush() should have persisted the data already.  If it was skipped or
-	// failed, try one last time here.  FUSE does not wait for the RELEASE
-	// reply, so any error is silently swallowed by the kernel; this is
-	// best-effort only.
-	h.fs.mu.Lock()
-	defer h.fs.mu.Unlock()
-	_ = h.writeLocked()
-	return nil
-}
-
-func (h *FileHandle) Flush(_ context.Context, _ *fuse.FlushRequest) error {
-	if !h.dirty {
-		return nil
-	}
-	// FUSE_FLUSH is synchronous: the kernel waits for the reply before
-	// close() returns to the caller.  Writing here ensures that the data
-	// reaches the tape and the index is updated before cp (or any other
-	// writer) sees close() succeed.
-	h.fs.mu.Lock()
-	defer h.fs.mu.Unlock()
-	return h.writeLocked()
-}
-
-// writeLocked persists dirty data to tape and saves the updated index.
-// It must be called with h.fs.mu held for writing.
-// On full success it clears h.dirty so subsequent calls are no-ops.
-func (h *FileHandle) writeLocked() error {
-	idx, err := h.fs.loadIndex()
-	if err != nil {
-		return fuse.EIO
-	}
-	file, parent, err := idx.FindFile(h.path)
-	if err != nil {
-		return fuse.ENOENT
-	}
-
-	now := ltfs.Now()
-	file.Length = int64(len(h.data))
-	file.OpenForWrite = false
-	if len(h.data) == 0 {
-		file.ExtentInfo.Extents = nil
-	} else {
-		extent, err := h.fs.tape.WriteFileData(h.data, idx)
-		if err != nil {
-			return err
-		}
-		file.ExtentInfo.Extents = []ltfs.Extent{extent}
-	}
-	ltfs.TouchFile(file, now)
-	ltfs.TouchDirectory(parent, now)
-	if err := h.fs.saveIndex(idx); err != nil {
-		return err
-	}
-	h.dirty = false
-	return nil
+return nil
 }
 
 func (ff *FlushFile) Attr(_ context.Context, a *fuse.Attr) error {
-	a.Mode = 0o222
-	a.Size = 0
-	return nil
+a.Mode = 0o222
+a.Size = 0
+return nil
 }
 
 func (ff *FlushFile) Open(_ context.Context, _ *fuse.OpenRequest, _ *fuse.OpenResponse) (bazilfs.Handle, error) {
-	return &FlushHandle{fs: ff.fs}, nil
+return &FlushHandle{fs: ff.fs}, nil
 }
 
 func (h *FlushHandle) Read(_ context.Context, _ *fuse.ReadRequest, resp *fuse.ReadResponse) error {
-	resp.Data = []byte{}
-	return nil
+resp.Data = []byte{}
+return nil
 }
 
 func (h *FlushHandle) Write(_ context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
-	h.fs.mu.Lock()
-	defer h.fs.mu.Unlock()
+h.fs.mu.Lock()
+defer h.fs.mu.Unlock()
 
-	idx, err := h.fs.loadIndex()
-	if err != nil {
-		return fuse.EIO
-	}
-	if err := h.fs.tape.FlushIndex(idx); err != nil {
-		return err
-	}
-	if err := h.fs.saveIndex(idx); err != nil {
-		return err
-	}
-	resp.Size = len(req.Data)
-	return nil
+idx, err := h.fs.loadIndex()
+if err != nil {
+return fuse.EIO
+}
+if err := h.fs.tape.FlushIndex(idx); err != nil {
+return err
+}
+if err := h.fs.saveIndex(idx); err != nil {
+return err
+}
+resp.Size = len(req.Data)
+return nil
 }
 
 func (h *FlushHandle) Release(_ context.Context, _ *fuse.ReleaseRequest) error {
-	return nil
+return nil
 }
 
 func (h *FlushHandle) Flush(_ context.Context, _ *fuse.FlushRequest) error {
-	return nil
+return nil
 }
