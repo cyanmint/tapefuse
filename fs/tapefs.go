@@ -418,15 +418,14 @@ func (t *TapeFS) DataBlockCapacity(blockNum uint64) int64 {
 // Best-fit selection: among available spaces whose ByteCount >= len(data),
 // the one with the smallest ByteCount is chosen.
 //
-// File-backed tape: any available space may be reused by overwriting the block
-// in-place (safe because the file is random-access).
+// File-backed tape: the best-fit block is overwritten in-place with zero-
+// padding to preserve the block's physical size.
 //
-// SCSI tape: reuse is only safe when no live data physically follows the
-// candidate block (seeking backward overwrites everything after the head).
-// For each candidate space, the index is scanned for the highest live-file
-// StartBlock; the space is eligible only if its StartBlock exceeds that value.
-// On a match the tape head is rewound to the space's block via TruncateAt and
-// the file is written from there with AppendFileData.
+// SCSI tape: the tape head is rewound to the best-fit block via TruncateAt,
+// then AppendFileData writes the new file from that position. This is safe
+// whenever len(data) <= sp.ByteCount: the write occupies exactly len(data)
+// bytes (one tape block), and the drive advances to the next position, leaving
+// all subsequent live data blocks intact.
 //
 // On reuse the selected entry is removed from idx.AvailableSpaces.
 func (t *TapeFS) WriteFileData(data []byte, idx *ltfs.Index) (ltfs.Extent, error) {
@@ -463,25 +462,19 @@ func (t *TapeFS) WriteFileData(data []byte, idx *ltfs.Index) (ltfs.Extent, error
 			}, nil
 		}
 	} else {
-		// SCSI tape: only safe to reuse a space when nothing live comes after
-		// it on the physical tape.  Compute the highest StartBlock currently
-		// referenced by any live file.
-		var maxLiveBlock int64 = -1
-		for _, f := range ltfs.AllFiles(idx.Root) {
-			for _, ext := range f.ExtentInfo.Extents {
-				if ext.StartBlock > maxLiveBlock {
-					maxLiveBlock = ext.StartBlock
-				}
-			}
-		}
-
+		// SCSI tape: seek to the available space block and write from there.
+		// This is safe as long as len(data) <= sp.ByteCount: the new file's
+		// single write() call occupies exactly len(data) bytes and the tape
+		// drive advances the head one block; the existing filemark that
+		// followed the original file on tape is then overwritten by our new
+		// filemark, and all live data blocks beyond sp.StartBlock+1 are
+		// preserved because we do not advance the head past them.
+		//
+		// Best-fit: pick the smallest available space whose ByteCount >=
+		// len(data) so that the remaining gap is minimised.
 		best := -1
 		for i, sp := range idx.AvailableSpaces {
 			if sp.Partition != "b" || sp.ByteCount < int64(len(data)) {
-				continue
-			}
-			// Skip spaces that have live data physically after them.
-			if sp.StartBlock <= maxLiveBlock {
 				continue
 			}
 			if best < 0 || idx.AvailableSpaces[best].ByteCount > sp.ByteCount {

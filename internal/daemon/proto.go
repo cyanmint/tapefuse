@@ -4,6 +4,7 @@ const (
 	SocketPath = "/tmp/ltape/ltaped.sock"
 	IndexDir   = "/tmp/ltape/index"
 	IndexExt   = ".index"
+	PidPath    = "/tmp/ltape/ltaped.pid"
 )
 
 type Request struct {
