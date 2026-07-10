@@ -64,7 +64,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 cleanup() {
   set +e
   ltape umount "$LETTER" 2>/dev/null
-  ltape daemon off 2>/dev/null
+  ltape killdaemon 2>/dev/null
   fusermount -u "$MOUNT_POINT" 2>/dev/null
   rm -rf "$WORK_DIR"
 }
@@ -73,7 +73,7 @@ trap cleanup EXIT
 wait_for_daemon() {
   local retries=20
   while (( retries-- > 0 )); do
-    if ltape list &>/dev/null; then return 0; fi
+    if [[ -S /tmp/ltape/ltaped.sock ]]; then return 0; fi
     sleep 0.2
   done
   fail "daemon did not start within 4 s"
@@ -83,12 +83,12 @@ wait_for_daemon() {
 mkdir -p "$MOUNT_POINT"
 
 echo "── Step 1: start daemon ──"
-ltape daemon on
+ltape startdaemon
 wait_for_daemon
 
 echo "── Step 2: init tape ──"
 ltape assign "$DEVICE" "$LETTER"
-ltape init "$LETTER"
+ltape indexread -f "$LETTER"
 
 echo "── Step 3: mount ──"
 ltape mount "$LETTER" "$MOUNT_POINT"
@@ -117,19 +117,19 @@ echo "── Step 6: umount ──"
 ltape umount "$LETTER"
 
 echo "── Step 7: commit index to tape ──"
-ltape commit "$LETTER"
+ltape commitindex "$LETTER"
 
 echo "── Step 8: kill daemon ──"
-ltape daemon off
+ltape killdaemon
 sleep 0.5
 
 echo "── Step 9: start fresh daemon ──"
-ltape daemon on
+ltape startdaemon
 wait_for_daemon
 
 echo "── Step 10: reload tape ──"
 ltape assign "$DEVICE" "$LETTER"
-ltape load "$LETTER"
+ltape indexread -f "$LETTER"
 
 echo "── Step 11: remount ──"
 ltape mount "$LETTER" "$MOUNT_POINT"
@@ -149,7 +149,7 @@ SIZE1_R=$(stat -c%s "$MOUNT_POINT/file1.txt")
 
 echo "── Step 13: cleanup ──"
 ltape umount "$LETTER"
-ltape daemon off
+ltape killdaemon
 
 echo ""
 echo "All integration tests PASSED ✓"

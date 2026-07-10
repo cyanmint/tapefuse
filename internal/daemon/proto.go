@@ -13,16 +13,11 @@ type Request struct {
 }
 
 type Response struct {
-	OK      bool          `json:"ok"`
-	Error   string        `json:"error,omitempty"`
-	Entries []EntryStatus `json:"entries,omitempty"`
-}
-
-type EntryStatus struct {
-	Letter     string `json:"letter"`
-	Device     string `json:"device"`
-	Loaded     bool   `json:"loaded"`
-	MountPoint string `json:"mountpoint,omitempty"`
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+	// Output holds human-readable text (e.g. an "ls" listing) for the client
+	// to print verbatim.
+	Output string `json:"output,omitempty"`
 }
 
 // IndexPath returns the disk cache path for a letter.

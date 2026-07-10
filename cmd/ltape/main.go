@@ -20,6 +20,10 @@ func verbosef(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "ltape: "+format+"\n", args...)
 }
 
+// clientCmds are handled locally by the ltape client and are not forwarded to
+// the daemon.
+var clientCmds = []string{"startdaemon", "killdaemon"}
+
 func main() {
 	// When invoked as "ltaped" (e.g. via a symlink) run the daemon directly
 	// in the foreground.
@@ -35,9 +39,10 @@ func main() {
 	cmd := os.Args[1]
 	args := os.Args[2:]
 
-	// Resolve the top-level command via unambiguous prefix matching.
-	// "daemon" is handled locally; all other commands are forwarded to ltaped.
-	allCmds := append([]string{"daemon"}, daemon.KnownCmds...)
+	// Resolve the top-level command via unambiguous prefix matching.  The
+	// daemon-lifecycle commands are handled locally; all others are forwarded
+	// to ltaped.
+	allCmds := append(append([]string{}, clientCmds...), daemon.KnownCmds...)
 	resolvedCmd, err := daemon.ResolveCmd(cmd, allCmds)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -45,25 +50,21 @@ func main() {
 	}
 	cmd = resolvedCmd
 
-	// Handle daemon lifecycle commands locally — they do not talk to the
-	// running daemon process.
-	if cmd == "daemon" {
-		if len(args) < 1 {
-			fmt.Fprintln(os.Stderr, "usage: ltape daemon <on|off>")
-			os.Exit(1)
-		}
-		sub, err := daemon.ResolveCmd(args[0], []string{"on", "off"})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "daemon: %s\n", err)
-			os.Exit(1)
-		}
-		switch sub {
-		case "on":
-			daemonOn()
-		case "off":
-			daemonOff()
-		}
+	switch cmd {
+	case "startdaemon":
+		startDaemon()
 		return
+	case "killdaemon":
+		killDaemon()
+		return
+	}
+
+	// Translate the user-facing arguments into the normalised protocol
+	// arguments expected by the daemon.
+	protoArgs, err := buildArgs(cmd, args)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: %s\n", cmd, err)
+		os.Exit(1)
 	}
 
 	verbosef("connecting to %s", daemon.SocketPath)
@@ -74,17 +75,8 @@ func main() {
 	}
 	defer conn.Close()
 
-	req := daemon.Request{Cmd: cmd, Args: args}
-	if cmd == "mount" {
-		var err error
-		args, err = parseMountArgs(args)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "mount: %s\n", err)
-			os.Exit(1)
-		}
-		req.Args = args
-	}
-	verbosef("sending command %q with args [%s]", cmd, strings.Join(args, " "))
+	req := daemon.Request{Cmd: cmd, Args: protoArgs}
+	verbosef("sending command %q with args [%s]", cmd, strings.Join(protoArgs, " "))
 	enc := json.NewEncoder(conn)
 	if err := enc.Encode(req); err != nil {
 		fmt.Fprintf(os.Stderr, "send: %v\n", err)
@@ -92,6 +84,7 @@ func main() {
 	}
 
 	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 1024*1024), 16*1024*1024)
 	if !scanner.Scan() {
 		fmt.Fprintln(os.Stderr, "no response from ltaped")
 		os.Exit(1)
@@ -106,32 +99,159 @@ func main() {
 		os.Exit(1)
 	}
 
-	if cmd == "list" {
-		verbosef("received %d tape assignment(s)", len(resp.Entries))
-		if len(resp.Entries) == 0 {
-			fmt.Println("no tapes assigned")
-			return
-		}
-		for _, e := range resp.Entries {
-			status := "not loaded"
-			if e.Loaded {
-				status = "loaded"
-			}
-			mount := "not mounted"
-			if e.MountPoint != "" {
-				mount = "mounted at " + e.MountPoint
-			}
-			fmt.Printf("%s: %s  [%s, %s]\n", e.Letter, e.Device, status, mount)
-		}
-		return
+	if resp.Output != "" {
+		fmt.Print(resp.Output)
+	} else {
+		fmt.Println("ok")
 	}
-
 	verbosef("command %q completed successfully", cmd)
-	fmt.Println("ok")
+}
+
+// parseAddr splits a "letter:/path" tape address into its letter and path
+// components.  The path defaults to "/" when omitted.
+func parseAddr(s string) (letter, path string, err error) {
+	i := strings.IndexByte(s, ':')
+	if i < 0 {
+		return "", "", fmt.Errorf("invalid address %q (want letter:/path)", s)
+	}
+	letter = s[:i]
+	path = s[i+1:]
+	if letter == "" {
+		return "", "", fmt.Errorf("invalid address %q (missing letter)", s)
+	}
+	if path == "" {
+		path = "/"
+	}
+	return letter, path, nil
+}
+
+func abspath(p string) (string, error) {
+	return filepath.Abs(p)
+}
+
+// buildArgs converts the user-supplied CLI arguments for cmd into the
+// normalised argument list understood by the daemon protocol.
+func buildArgs(cmd string, args []string) ([]string, error) {
+	switch cmd {
+	case "assign":
+		if len(args) != 2 {
+			return nil, fmt.Errorf("usage: ltape assign <device> <letter>")
+		}
+		return []string{args[0], args[1]}, nil
+
+	case "indexread":
+		mode := "file"
+		var pos []string
+		for _, a := range args {
+			switch a {
+			case "-m", "--memory":
+				mode = "memory"
+			case "-f", "--file":
+				mode = "file"
+			default:
+				pos = append(pos, a)
+			}
+		}
+		if len(pos) != 1 {
+			return nil, fmt.Errorf("usage: ltape indexread [-m|-f] <letter>")
+		}
+		return []string{pos[0], mode}, nil
+
+	case "ls":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("usage: ltape ls <letter>:/path")
+		}
+		letter, path, err := parseAddr(args[0])
+		if err != nil {
+			return nil, err
+		}
+		return []string{letter, path}, nil
+
+	case "rm":
+		recursive := false
+		var pos []string
+		for _, a := range args {
+			switch a {
+			case "-r", "-R", "--recursive":
+				recursive = true
+			default:
+				pos = append(pos, a)
+			}
+		}
+		if len(pos) != 1 {
+			return nil, fmt.Errorf("usage: ltape rm [-r] <letter>:/path")
+		}
+		letter, path, err := parseAddr(pos[0])
+		if err != nil {
+			return nil, err
+		}
+		return []string{letter, path, strconv.FormatBool(recursive)}, nil
+
+	case "get":
+		if len(args) < 1 || len(args) > 2 {
+			return nil, fmt.Errorf("usage: ltape get <letter>:/path [dest]")
+		}
+		letter, path, err := parseAddr(args[0])
+		if err != nil {
+			return nil, err
+		}
+		dest := "."
+		if len(args) == 2 {
+			dest = args[1]
+		}
+		destAbs, err := abspath(dest)
+		if err != nil {
+			return nil, err
+		}
+		return []string{letter, path, destAbs}, nil
+
+	case "push":
+		if len(args) != 2 {
+			return nil, fmt.Errorf("usage: ltape push <local> <letter>:/path")
+		}
+		srcAbs, err := abspath(args[0])
+		if err != nil {
+			return nil, err
+		}
+		letter, path, err := parseAddr(args[1])
+		if err != nil {
+			return nil, err
+		}
+		return []string{letter, path, srcAbs}, nil
+
+	case "mount":
+		kind := "file"
+		var pos []string
+		for _, a := range args {
+			switch a {
+			case "-m", "--memory":
+				kind = "memory"
+			case "-f", "--file":
+				kind = "file"
+			default:
+				pos = append(pos, a)
+			}
+		}
+		if len(pos) != 2 {
+			return nil, fmt.Errorf("usage: ltape mount [-m|-f] <letter> <mountpoint>")
+		}
+		mp, err := abspath(pos[1])
+		if err != nil {
+			return nil, err
+		}
+		return []string{pos[0], mp, kind}, nil
+
+	case "umount", "flush", "commitindex", "discardindex", "defrag":
+		if len(args) != 1 {
+			return nil, fmt.Errorf("usage: ltape %s <letter>", cmd)
+		}
+		return []string{args[0]}, nil
+	}
+	return nil, fmt.Errorf("unknown command %q", cmd)
 }
 
 // runDaemon runs the tape daemon in the foreground (used when invoked as
-// "ltaped" or forked by daemonOn).
+// "ltaped" or forked by startDaemon).
 func runDaemon() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.Printf("ltaped: starting up")
@@ -139,7 +259,7 @@ func runDaemon() {
 		log.Fatalf("ltaped: create /tmp/ltape: %v", err)
 	}
 
-	// Write PID file so "ltape daemon off" can find and terminate us.
+	// Write PID file so "ltape killdaemon" can find and terminate us.
 	pidData := fmt.Sprintf("%d\n", os.Getpid())
 	if err := os.WriteFile(daemon.PidPath, []byte(pidData), 0o644); err != nil {
 		log.Fatalf("ltaped: write pid file: %v", err)
@@ -165,9 +285,9 @@ func runDaemon() {
 	log.Printf("ltaped: received signal %s, shutting down", sig)
 }
 
-// daemonOn forks a background daemon process (this binary with LTAPE_DAEMON=1
-// set so the child immediately calls runDaemon).
-func daemonOn() {
+// startDaemon forks a background daemon process (this binary invoked as
+// "ltaped" so the child immediately calls runDaemon).
+func startDaemon() {
 	// Check if already running.
 	if data, err := os.ReadFile(daemon.PidPath); err == nil {
 		pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
@@ -208,8 +328,8 @@ func daemonOn() {
 	fmt.Printf("ltaped started (pid %d)\n", proc.Pid)
 }
 
-// daemonOff reads the PID file and sends SIGTERM to the daemon.
-func daemonOff() {
+// killDaemon reads the PID file and sends SIGTERM to the daemon.
+func killDaemon() {
 	data, err := os.ReadFile(daemon.PidPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cannot read pid file %s: %v\n", daemon.PidPath, err)
@@ -232,97 +352,32 @@ func daemonOff() {
 	fmt.Printf("ltaped (pid %d) signalled to stop\n", pid)
 }
 
-// parseMountArgs parses the CLI arguments for the "mount" command.  It
-// extracts optional buffer flags (-m/-f/--memory/--file/-s/--stream) and
-// returns a normalised 4-element slice: [letter, mountpoint, bufkind, bufsize]
-// suitable for the daemon protocol.  When no flag is supplied the defaults
-// (file, 0) are used.
-//
-// Supported flag forms:
-//
-//	-m<size>         in-memory buffer, e.g. -m1G  (0 = no limit)
-//	--memory=<size>  in-memory buffer, e.g. --memory=1G
-//	-f<size>         file-backed buffer, e.g. -f4G (0 = no limit)
-//	--file=<size>    file-backed buffer, e.g. --file=4G
-//	-s               streaming mode (write directly to tape)
-//	--stream         streaming mode (write directly to tape)
-func parseMountArgs(args []string) ([]string, error) {
-	kind := "file"
-	size := "0" // default: no limit
-	var pos []string
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		switch {
-		case strings.HasPrefix(a, "--memory="):
-			kind = "memory"
-			size = strings.TrimPrefix(a, "--memory=")
-		case strings.HasPrefix(a, "--file="):
-			kind = "file"
-			size = strings.TrimPrefix(a, "--file=")
-		case a == "--stream" || a == "-s":
-			kind = "stream"
-			size = "0"
-		case strings.HasPrefix(a, "-m"):
-			kind = "memory"
-			size = strings.TrimPrefix(a, "-m")
-			if size == "" {
-				i++
-				if i >= len(args) {
-					return nil, fmt.Errorf("-m requires a size argument (e.g. -m1G or -m0)")
-				}
-				size = args[i]
-			}
-		case strings.HasPrefix(a, "-f"):
-			kind = "file"
-			size = strings.TrimPrefix(a, "-f")
-			if size == "" {
-				i++
-				if i >= len(args) {
-					return nil, fmt.Errorf("-f requires a size argument (e.g. -f4G or -f0)")
-				}
-				size = args[i]
-			}
-		default:
-			pos = append(pos, a)
-		}
-	}
-	if len(pos) != 2 {
-		return nil, fmt.Errorf("mount requires <letter> <mountpoint>")
-	}
-	return append(pos, kind, size), nil
-}
-
 func usage() {
 	fmt.Fprintln(os.Stderr, `Usage: ltape <command> [args]
 
 Daemon management:
-  daemon on               start the tape daemon in the background
-  daemon off              stop the running tape daemon
+  startdaemon                 start the tape daemon in the background
+  killdaemon                  stop the running tape daemon
 
   (Alternatively: symlink or copy ltape to ltaped; running ltaped starts
    the daemon in the foreground.)
 
 Tape commands:
-  assign <device> <letter>    assign letter to tape device
-  unassign <letter>           free letter
-  init <letter>               initialize tape
-  load <letter>               read index from tape to disk cache
-  commit <letter>             write index from disk cache to tape
-  discard <letter>            discard disk cache index
-  mount [-m<size>|-f<size>|-s] <letter> <mountpoint>
-                              mount tape filesystem
-                                -m<size>  / --memory=<size>  use in-memory write buffer
-                                -f<size>  / --file=<size>    use file-backed write buffer
-                                                             (in /tmp/ltape/buffer)
-                                size examples: 0 (no limit), 1G, 4G, 512M
-                                default: file-backed, no limit (-f0)
-                                -s        / --stream         write directly to tape (no buffer)
-  umount <letter>             unmount tape filesystem
-  eject <letter>              eject tape (assignment is kept; use swallow to reload)
-  swallow <letter>            load previously ejected tape
-  list                        list assigned tapes and their status
-  defrag <letter> [size]      compact tape by removing deleted-file gaps
-                              (default size limit for staging area: 10G)
-  flushfiles <letter>         flush all open file write buffers to tape immediately`)
+  assign <device> <letter>        assign a letter to a tape device
+  indexread [-m|-f] <letter>      read the index from tape
+                                    -m  keep the index in memory
+                                    -f  cache the index on disk (default)
+  ls <letter>:/path               list a directory (or file) on tape
+  rm [-r] <letter>:/path          remove a file, or a directory tree with -r
+  get <letter>:/path [dest]       copy a file/dir from tape to local disk
+  push <local> <letter>:/path     copy a local file/dir onto tape (overwrite)
+  mount [-m|-f] <letter> <dir>    mount the tape as a FUSE filesystem
+                                    -m  in-memory temp dir
+                                    -f  file-backed temp dir (default)
+  umount <letter>                 unmount the tape filesystem
+  flush <letter>                  flush the mount temp dir to tape
+  commitindex <letter>            write the working index back to tape
+  discardindex <letter>           discard the working index
+  defrag <letter>                 defragment the tape (currently a no-op stub)`)
 	os.Exit(1)
 }

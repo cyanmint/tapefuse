@@ -30,30 +30,28 @@ filesystem backed by a real or emulated LTO tape drive using the
   - *Overwrite existing file*: the current tape content is pre-loaded into the
     buffer on the first write, the writes are applied, and the merged result is
     written back as a single block on close (old extents are freed).
-- **Configurable write buffers** — `ltape mount -f0 …` (default) uses a
-  temporary file in `/tmp/ltape/buffer/`; `-m0` uses heap memory; a size
-  suffix caps the per-file buffer (e.g. `-f4G`, `-m1G`); `0` means no limit.
-  File-backed buffers keep large write-staging data off the Go heap and let the
-  OS page it under memory pressure.
-- **Immediate flush** — `ltape flushfiles <letter>` flushes all currently-open
-  dirty file buffers to tape without waiting for the file descriptors to close,
-  useful for transferring files that remain open for a long time.
-- **Disk-cached index** — the LTFS index XML is never held only in RAM; it is
-  read from and written to `/tmp/ltape/index/<letter>.index` on every metadata
-  operation, so the cache is always consistent and survives daemon crashes
-- **Explicit commit** — the LTFS index must be committed separately with
-  `ltape commit` (or by writing to `/.tapefuse_flush`); this mirrors how real
-  tape drives work and prevents index bloat
+- **Direct tape transfers** — `ltape push` and `ltape get` copy files and
+  directory trees between the local filesystem and tape without mounting, and
+  `ltape ls` / `ltape rm` inspect and delete tape content straight from the
+  index.
+- **Configurable temp dir** — `ltape mount -f …` (default) stages writes in a
+  file-backed temporary area under `/tmp/ltape/buffer/`; `-m` keeps the temp
+  data in heap memory.  Staged files are written to tape on close, or on demand
+  with `ltape flush <letter>`.
+- **In-memory or disk-cached index** — `ltape indexread -f` caches the LTFS
+  index XML in `/tmp/ltape/index/<letter>.index` (survives daemon restarts),
+  while `ltape indexread -m` keeps the working index entirely in daemon memory.
+- **Explicit commit** — the LTFS index must be written back to tape separately
+  with `ltape commitindex` (or by writing to `/.tapefuse_flush` inside a
+  mount); this mirrors how real tape drives work and prevents index bloat.
 - **Sparse space reuse** — deleted-file blocks are recorded as available space
-  in the index and reused on subsequent writes (best-fit selection)
-- **Defrag** — `ltape defrag` compacts the data partition by staging live files
-  to disk, truncating at the first gap, and rewriting them sequentially
-- **Physical eject** — `ltape eject` unmounts the FUSE filesystem, waits for
-  the FUSE goroutine to exit, and issues the SCSI `MTOFFL` command to
-  physically retract the tape before removing the assignment
+  in the index, contiguous holes are merged, and the pool is reused on
+  subsequent writes (best-fit selection).
+- **Defrag** — `ltape defrag` is currently a no-op stub that only logs the
+  request.
 - **Prefix abbreviation** — all `ltape` commands support unambiguous prefix
   matching: `ltape mo a /mnt` resolves to `mount`; an ambiguous prefix like
-  `d` prints `ambiguous: "d" matches daemon, defrag, discard`
+  `d` prints `ambiguous: "d" matches defrag, discardindex`
 - **Verbose operation logs** — `ltaped` logs daemon lifecycle and command
   handling; `ltape` prints request/response progress to stderr
 
@@ -94,37 +92,38 @@ CGO_ENABLED=0 go build -ldflags '-extldflags "-static"' -o ltape  ./cmd/ltape
 
 ```bash
 # 1. Start the daemon (in the background or a separate terminal)
-./ltape daemon on          # or: ./ltaped &
+./ltape startdaemon        # or: ./ltaped &
 
 # 2. Assign a device path to a short letter.
 #    For file-backed mode, use any non-existent path prefix.
 #    ltaped will create <path>.p0.dat and <path>.p1.dat automatically.
 ./ltape assign /tmp/mytape a
 
-# 3. Initialize (format) the tape image
-./ltape init a
+# 3. Read the LTFS index from the tape into the disk cache.
+#    For a fresh file-backed path this also formats a new empty tape.
+#    Use -m instead of -f to keep the working index in daemon memory.
+./ltape indexread -f a
 
-# 4. Load the LTFS index from the tape image into the disk cache
-./ltape load a
+# 4a. Copy files straight to/from tape without mounting.
+./ltape push ./myfile.txt a:/docs/myfile.txt
+./ltape ls   a:/docs
+./ltape get  a:/docs/myfile.txt ./restored.txt
+./ltape rm   a:/docs/myfile.txt
 
-# 5. Mount the filesystem (default: file-backed buffer, no size limit)
+# 4b. …or mount it as a filesystem (default: file-backed temp dir).
 mkdir -p /mnt/tape
 ./ltape mount a /mnt/tape
-# Or: in-memory buffer with 1 GiB cap:  ./ltape mount -m1G a /mnt/tape
-# Or: file-backed buffer with 4 GiB cap: ./ltape mount -f4G a /mnt/tape
-
-# 6. Use it like any directory — writes go to tape immediately
+# Or with an in-memory temp dir:  ./ltape mount -m a /mnt/tape
 cp myfile.txt /mnt/tape/
 ls /mnt/tape/
-
-# 7. Commit: write the updated index back to the tape image
-./ltape commit a
-
-# 8. Unmount
+./ltape flush a            # push the staged temp files to tape now
 ./ltape umount a
 
-# 9. Clean up the assignment
-./ltape unassign a
+# 5. Commit: write the updated index back to the tape image
+./ltape commitindex a
+
+# 6. Stop the daemon
+./ltape killdaemon
 ```
 
 ### Using a real / MHVTL tape drive
@@ -133,15 +132,9 @@ ls /mnt/tape/
 ./ltaped &
 
 ./ltape assign /dev/nst0 a   # ltaped detects the char device automatically
-./ltape init   a             # writes VOL1 + LTFS label + empty index to tape
-./ltape load   a             # reads index back into disk cache
-mkdir -p /mnt/tape
-./ltape mount  a /mnt/tape
-
-cp bigfile.iso /mnt/tape/
-./ltape commit a             # flush disk-cached index to tape
-./ltape umount a
-./ltape eject  a             # MTOFFL ioctl + remove assignment
+./ltape indexread -f a       # reads the index into the disk cache
+./ltape push ./bigfile.iso a:/bigfile.iso
+./ltape commitindex a        # flush the working index to tape
 ```
 
 ---
@@ -149,13 +142,20 @@ cp bigfile.iso /mnt/tape/
 ## Command Reference
 
 All commands are sent to `ltaped` via the Unix socket at
-`/tmp/ltape/ltaped.sock`.  Commands support **unambiguous prefix
+`/tmp/ltape/ltaped.sock` (except `startdaemon` / `killdaemon`, which are handled
+locally by the `ltape` client).  Commands support **unambiguous prefix
 abbreviation**: type enough letters to uniquely identify a command.
 An ambiguous prefix prints all matches; e.g. `ltape d` prints
-`ambiguous: "d" matches daemon, defrag, discard`.
+`ambiguous: "d" matches defrag, discardindex`.
+
+A tape address has the form `<letter>:/path/on/tape` (the path defaults to `/`
+when omitted).
 
 ```
 ltape <command> [args]
+
+  startdaemon                  Fork ltaped into the background.
+  killdaemon                   Signal the running ltaped to stop.
 
   assign  <device> <letter>    Register a device under a single-character letter.
                                 <device> may be:
@@ -164,65 +164,57 @@ ltape <command> [args]
                                     /tmp/tape1.p1.dat)
                                   • A no-rewind SCSI tape device, e.g. /dev/nst0
 
-  unassign <letter>            Release a letter.  The tape must not be mounted.
+  indexread [-m|-f] <letter>   Open the tape and read the LTFS index from block 3
+                                of the index partition.  For a fresh file-backed
+                                path the tape is formatted first.
+                                  -f  cache the index on disk at
+                                      /tmp/ltape/index/<letter>.index (default)
+                                  -m  keep the working index in daemon memory
 
-  init     <letter>            Format the tape: write a VOL1 ANSI label, LTFS
-                                partition labels, and an empty LTFS index.
-                                Destroys all existing content.
+  ls  <letter>:/path           List a directory (or a single file) on tape.
 
-  load     <letter>            Open the tape partitions, read the LTFS index
-                                from block 3 of the index partition, and write
-                                it to the disk cache at
-                                /tmp/ltape/index/<letter>.index.
+  rm [-r] <letter>:/path       Remove a file, or a directory tree with -r,
+                                marking freed tape ranges as available space in
+                                the index (contiguous holes are merged).
 
-  commit   <letter>            Read the disk-cached index and write it to the
-                                tape (rewind to block 3, overwrite, write double
-                                filemark).  Increments the generation number.
+  get <letter>:/path [dest]    Read a file or directory tree directly from tape
+                                and write it to the local filesystem (default
+                                destination: the current directory).
 
-  discard  <letter>            Close the tape partitions and delete the
-                                disk-cached index without writing to tape.
-                                Use this to abandon uncommitted changes.
+  push <local> <letter>:/path  Write a local file or directory tree onto tape,
+                                updating the index and overwriting any existing
+                                target.
 
-  mount [-m<size>|-f<size>] <letter> <mountpoint>
-                               Mount the tape as a FUSE filesystem.  The daemon
-                               creates <mountpoint> if it does not exist.
-                               Requires load to have been run first.
-
-                               Buffer options (controls how write data is held
-                               before being flushed to tape on close):
-                                 -m<size> / --memory=<size>
-                                     In-memory (heap) write buffer.
-                                 -f<size> / --file=<size>
-                                     File-backed buffer in /tmp/ltape/buffer/
-                                     (default).
-                                 <size> is a byte count with optional suffix:
-                                 0 = no limit, 1G, 4G, 512M, etc.
-                                 Default (no flag): file-backed, no limit (-f0).
+  mount [-m|-f] <letter> <dir> Mount the tape as a FUSE filesystem.  The daemon
+                                creates <dir> if it does not exist.  Requires
+                                indexread to have been run first.
+                                  -f  file-backed temp dir in /tmp/ltape/buffer/
+                                      (default)
+                                  -m  in-memory (heap) temp dir
 
   umount   <letter>            Unmount the FUSE filesystem.
 
-  eject    <letter>            Unmount (if mounted), wait for the FUSE goroutine
-                                to exit, issue MTOFFL on SCSI devices, and
-                                close open handles.  The letter assignment is
-                                kept so you can swallow the tape back later.
+  flush    <letter>            Push all staged files in the mount temp dir to
+                                tape immediately, without waiting for file
+                                descriptors to be closed.
 
-  swallow  <letter>            Issue MTLOAD on SCSI devices to load media that
-                                was previously ejected; no-op for file-backed
-                                assignments.
+  commitindex   <letter>       Write the working index (from memory or the disk
+                                cache) back to the tape (rewind to block 3,
+                                overwrite, write double filemark).  Increments the
+                                generation number.
 
-  list                         Print all assignments with their current status:
-                                  a: /dev/nst0  [loaded] (mounted at /mnt/tape)
-                                  b: /tmp/tape2 [not loaded]
+  discardindex  <letter>       Close the tape partitions and drop the working
+                                index without writing to tape.  Use this to
+                                abandon uncommitted changes.
 
-  flushfiles <letter>          Flush all currently-open dirty file write buffers
-                               to tape immediately, without waiting for file
-                               descriptors to be closed.
+  defrag   <letter>            Currently a no-op stub: logs the request and
+                                returns.
 ```
 
 ### Flushing inside the mount
 
 Writing any data to the special file `/.tapefuse_flush` inside the mount point
-triggers an immediate index flush to tape (equivalent to `ltape commit`):
+triggers an immediate index flush to tape (equivalent to `ltape commitindex`):
 
 ```bash
 echo flush > /mnt/tape/.tapefuse_flush
@@ -233,14 +225,15 @@ echo flush > /mnt/tape/.tapefuse_flush
 ## Normal Workflow Summary
 
 ```
-assign → init → load → mount → (use FS) → commit → umount → eject → swallow → load → ...
-                                                                     └── unassign (to remove)
+assign → indexread → (push/get/ls/rm  or  mount → use FS → flush → umount)
+       → commitindex → …
 ```
 
-After `mount`, file data written through the FUSE filesystem is committed to
-tape immediately when each file is closed.  The directory index (filenames,
-sizes, timestamps, extent locations) lives in the disk cache and must be
-committed with `ltape commit` or by writing to `/.tapefuse_flush`.
+After `mount`, file data written through the FUSE filesystem is staged in the
+temp dir and written to tape when each file is closed (or on `ltape flush`).
+The directory index (filenames, sizes, timestamps, extent locations) lives in
+the working index and must be written back with `ltape commitindex` or by
+writing to `/.tapefuse_flush`.
 
 ---
 
@@ -285,22 +278,25 @@ The LTFS index is an XML document that records the complete directory tree,
 per-file metadata, and the location of every file's data on tape (expressed
 as a list of extents: partition, startBlock, byteOffset, byteCount).
 
-tapefuse intentionally avoids keeping the index in RAM:
+tapefuse keeps the working index either in the disk cache or in daemon memory:
 
-1. `load` / `init` reads the index XML from tape and writes it to
-   `/tmp/ltape/index/<letter>.index`.
+1. `indexread -f` reads the index XML from tape and writes it to
+   `/tmp/ltape/index/<letter>.index`; `indexread -m` keeps it in daemon memory.
 2. Every FUSE metadata operation (Attr, Lookup, ReadDir, Create, Mkdir,
    Remove, Rename) reads the disk file, modifies it in memory, and writes it
    back atomically (write to `.tmp`, then `rename`).
-3. `commit` reads the disk file, calls `TapeFS.FlushIndex`, which rewinds to
-   block 3, overwrites the old index, writes two filemarks, and increments the
-   generation number.  The updated index is also written back to disk.
-4. `discard` simply deletes the disk cache file.
+3. `commitindex` reads the working index, calls `TapeFS.FlushIndex`, which
+   rewinds to block 3, overwrites the old index, writes two filemarks, and
+   increments the generation number.  The updated index is also written back.
+4. `discardindex` simply drops the working index (deleting the disk cache
+   file).
 
 File **data** never passes through the index cache.  On each `write(2)` the
-`FileHandle.Write` FUSE callback calls `TapeFS.WriteChunkToFile` directly,
-which either appends a new block to the data partition or rewrites the file
-in-place, then records the resulting extent(s) in the disk-cached index.
+`FileHandle.Write` FUSE callback stages the data in the mount's temp dir
+(memory- or file-backed); when the file is closed (or on `ltape flush`) the
+staged content is written to the data partition as a single block via
+`TapeFS.WriteFileData`, which reuses a freed slot where possible, and the
+resulting extent is recorded in the working index.
 
 ---
 
@@ -504,7 +500,7 @@ always addresses the "index partition" and "data partition" independently.
 
 **Why no in-memory index in the FUSE layer?**  
 Caching the parsed index in the FUSE layer would create a coherency problem:
-`commit` reads the disk cache, and `FileHandle.Write` writes to it.  If the
+`commitindex` reads the disk cache, and `FileHandle.Write` writes to it.  If the
 FUSE layer held a separate in-memory copy, a crash between a Write and a
 Commit could produce an index that referred to data blocks that were never
 actually written.  The disk-IO cost per metadata operation is negligible

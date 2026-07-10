@@ -8,15 +8,15 @@ import (
 
 // KnownCmds lists every tape command handled by the daemon.  It is exported
 // so that the ltape client binary can build the full top-level command list
-// (which also includes "daemon") for prefix resolution.
+// (which also includes the daemon-lifecycle commands) for prefix resolution.
 var KnownCmds = []string{
-	"assign", "unassign",
-	"init", "load", "commit", "discard",
+	"assign",
+	"indexread",
+	"ls", "rm", "get", "push",
 	"mount", "umount",
-	"eject", "swallow",
-	"list",
+	"flush",
+	"commitindex", "discardindex",
 	"defrag",
-	"flushfiles",
 }
 
 // ResolveCmd returns the canonical command name for input using unambiguous

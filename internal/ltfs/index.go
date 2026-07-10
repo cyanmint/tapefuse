@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"sort"
 	"strings"
 	"time"
 )
@@ -277,6 +278,30 @@ func (i *Index) NextFileUID() int64 {
 	return i.HighestFileUID
 }
 
+// MkdirAll ensures that every directory component of p exists, creating any
+// missing directories, and returns the deepest directory.  It fails if any
+// component along the path already exists as a file.
+func (i *Index) MkdirAll(p string) (*Directory, error) {
+	if i == nil || i.Root == nil {
+		return nil, errors.New("ltfs index missing root directory")
+	}
+	dir := i.Root
+	now := Now()
+	for _, part := range pathParts(p) {
+		if dir.FindFile(part) != nil {
+			return nil, fmt.Errorf("%s is a file, not a directory", part)
+		}
+		child := dir.FindDirectory(part)
+		if child == nil {
+			dir.Contents.Directories = append(dir.Contents.Directories, NewDirectory(part))
+			child = &dir.Contents.Directories[len(dir.Contents.Directories)-1]
+			TouchDirectory(dir, now)
+		}
+		dir = child
+	}
+	return dir, nil
+}
+
 func TouchDirectory(dir *Directory, ts string) {
 	dir.ChangeTime = ts
 	dir.ModifyTime = ts
@@ -301,6 +326,82 @@ func AllFiles(dir *Directory) []*File {
 		out = append(out, AllFiles(&dir.Contents.Directories[i])...)
 	}
 	return out
+}
+
+// MergeAvailableSpaces sorts the available-space pool by partition and start
+// block and merges entries that are physically contiguous on tape so that a
+// single large hole can satisfy a large write.  Two entries are considered
+// contiguous when the next block starts within the block span occupied by the
+// previous entry; each freed file occupies its data record plus a trailing
+// filemark (two blocks), so a gap of up to two blocks is tolerated.  Merged
+// entries keep the lowest start block and the sum of the freed capacities.
+func MergeAvailableSpaces(spaces []AvailableSpace) []AvailableSpace {
+	if len(spaces) < 2 {
+		return spaces
+	}
+	// Copy so callers that reuse the input slice are not surprised by the
+	// in-place sort below.
+	sorted := make([]AvailableSpace, len(spaces))
+	copy(sorted, spaces)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].Partition != sorted[j].Partition {
+			return sorted[i].Partition < sorted[j].Partition
+		}
+		return sorted[i].StartBlock < sorted[j].StartBlock
+	})
+
+	// blockSpan is the number of tape blocks a freed file occupies (one data
+	// record plus one filemark).
+	const blockSpan = 2
+
+	out := make([]AvailableSpace, 0, len(sorted))
+	var runEnd int64 // first block after the current merge run
+	for _, sp := range sorted {
+		if n := len(out); n > 0 {
+			last := &out[n-1]
+			if last.Partition == sp.Partition && sp.StartBlock <= runEnd {
+				if sp.StartBlock != last.StartBlock {
+					// Distinct adjacent block: accumulate its capacity.
+					last.ByteCount += sp.ByteCount
+				} else if sp.ByteCount > last.ByteCount {
+					// Duplicate free of the same block: keep the larger cap.
+					last.ByteCount = sp.ByteCount
+				}
+				if end := sp.StartBlock + blockSpan; end > runEnd {
+					runEnd = end
+				}
+				continue
+			}
+		}
+		out = append(out, sp)
+		runEnd = sp.StartBlock + blockSpan
+	}
+	return out
+}
+
+// FreeFileExtents returns the data-partition (partition "b") extents of file to
+// the index's available-space pool and merges contiguous entries.  physCap, if
+// non-nil, returns the true physical block capacity for a given start block so
+// that reused slots report their real size; when it returns <= 0 (or is nil)
+// the extent's logical byte count is used instead.
+func (i *Index) FreeFileExtents(file *File, physCap func(startBlock int64) int64) {
+	for _, ext := range file.ExtentInfo.Extents {
+		if ext.Partition != "b" || ext.ByteCount <= 0 {
+			continue
+		}
+		capacity := ext.ByteCount
+		if physCap != nil {
+			if c := physCap(ext.StartBlock); c > 0 {
+				capacity = c
+			}
+		}
+		i.AvailableSpaces = append(i.AvailableSpaces, AvailableSpace{
+			Partition:  ext.Partition,
+			StartBlock: ext.StartBlock,
+			ByteCount:  capacity,
+		})
+	}
+	i.AvailableSpaces = MergeAvailableSpaces(i.AvailableSpaces)
 }
 
 // LoadIndexFromFile reads an LTFS index from a disk cache file.
